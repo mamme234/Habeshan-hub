@@ -9,6 +9,7 @@ const jwt = require('jsonwebtoken');
 const TelegramBot = require('node-telegram-bot-api');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const axios = require('axios');
 
 // Import Models
 const User = require('./models/User');
@@ -29,8 +30,6 @@ app.use(express.urlencoded({ extended: true }));
 
 // Serve static files
 app.use('/uploads', express.static('uploads'));
-
-// Serve frontend static files if they exist
 app.use(express.static(path.join(__dirname, '../frontend')));
 
 // Rate limiting
@@ -81,55 +80,8 @@ const upload = multer({
 // Admin IDs from .env
 const ADMIN_IDS = process.env.ADMIN_IDS ? process.env.ADMIN_IDS.split(',').map(id => id.trim()) : [];
 
-// =====================
-// ROOT ROUTE
-// =====================
-
-app.get('/', (req, res) => {
-  res.json({
-    name: 'Habesha API',
-    version: '1.0.0',
-    status: 'running',
-    endpoints: {
-      auth: '/api/auth/telegram',
-      media: '/api/media',
-      purchases: '/api/purchases',
-      admin: '/api/admin',
-      docs: '/api/docs'
-    }
-  });
-});
-
-// API Documentation Route
-app.get('/api/docs', (req, res) => {
-  res.json({
-    endpoints: {
-      'POST /api/auth/telegram': 'Authenticate user with Telegram',
-      'GET /api/media': 'Get all media content',
-      'GET /api/media/:id': 'Get single media by ID',
-      'POST /api/purchase/initiate': 'Initiate purchase',
-      'POST /api/purchase/verify': 'Verify payment',
-      'GET /api/purchases': 'Get user purchases',
-      'POST /api/admin/media': 'Upload media (Admin)',
-      'PUT /api/admin/media/:id': 'Update media (Admin)',
-      'DELETE /api/admin/media/:id': 'Delete media (Admin)',
-      'GET /api/admin/stats': 'Get admin stats (Admin)',
-      'GET /api/admin/users': 'Get users (Admin)',
-      'PUT /api/admin/users/:userId/ban': 'Ban/Unban user (Admin)',
-      'GET /api/admin/admins': 'Get all admins (Admin)',
-      'POST /api/admin/admins': 'Add admin (Admin)',
-      'PUT /api/admin/admins/:adminId': 'Update admin (Admin)',
-      'DELETE /api/admin/admins/:adminId': 'Remove admin (Admin)',
-      'POST /api/admin/broadcast': 'Send broadcast (Admin)'
-    },
-    admin_roles: {
-      super_admin: 'Full access to everything',
-      content_manager: 'Manage content and view analytics',
-      moderator: 'Delete and edit content',
-      support: 'Manage users only'
-    }
-  });
-});
+// Temporary upload storage for bot uploads
+const tempUploads = {};
 
 // =====================
 // AUTHENTICATION MIDDLEWARE
@@ -212,7 +164,7 @@ bot.onText(/\/start/, async (msg) => {
     }
 
     const welcomeMessage = `
-🎬 Welcome to Habesha!
+🎬 *Welcome to Habesha!*
 
 Discover amazing Ethiopian content - videos, photos, and more!
 
@@ -228,9 +180,11 @@ Click the button below to open the app!
       reply_markup: {
         inline_keyboard: [
           [{ text: '🚀 Open App', web_app: { url: process.env.APP_URL } }],
-          [{ text: 'ℹ️ Help', callback_data: 'help' }]
+          [{ text: 'ℹ️ Help', callback_data: 'help' }],
+          ...(user.isAdmin ? [[{ text: '📤 Upload Content', callback_data: 'upload' }]] : [])
         ]
-      }
+      },
+      parse_mode: 'Markdown'
     };
 
     bot.sendMessage(chatId, welcomeMessage, options);
@@ -243,18 +197,22 @@ Click the button below to open the app!
 bot.onText(/\/help/, async (msg) => {
   const chatId = msg.chat.id;
   const helpMessage = `
-📚 Help & Support
+📚 *Help & Support*
 
 How to use Habesha:
-1. Click "Open App" to start
-2. Browse content in Videos & Photos
-3. Tap on content to see details
-4. Purchase to unlock full access
-5. View your purchases in "My Library"
+1️⃣ Click "Open App" to start
+2️⃣ Browse content in Videos & Photos
+3️⃣ Tap on content to see details
+4️⃣ Purchase to unlock full access
+5️⃣ View your purchases in "My Library"
+
+*Admin Commands:*
+/upload - Upload new content
+/cancel - Cancel current upload
 
 For support: @habesha_support
   `;
-  bot.sendMessage(chatId, helpMessage);
+  bot.sendMessage(chatId, helpMessage, { parse_mode: 'Markdown' });
 });
 
 bot.onText(/\/profile/, async (msg) => {
@@ -269,13 +227,13 @@ bot.onText(/\/profile/, async (msg) => {
 
     const purchases = await Purchase.find({ userId: user._id });
     const profileMessage = `
-👤 Profile
+👤 *Profile*
 
 Name: ${user.name}
 Username: @${user.username || 'Not set'}
 Total Purchases: ${purchases.length}
 Member Since: ${new Date(user.createdAt).toLocaleDateString()}
-${user.isAdmin ? `\n🔑 Admin: ${user.adminRole}` : ''}
+${user.isAdmin ? `\n🔑 *Admin:* ${user.adminRole}` : ''}
 
 Click "Open App" to view your library!
     `;
@@ -285,7 +243,8 @@ Click "Open App" to view your library!
         inline_keyboard: [
           [{ text: '📱 Open App', web_app: { url: process.env.APP_URL } }]
         ]
-      }
+      },
+      parse_mode: 'Markdown'
     });
   } catch (error) {
     console.error('Error in /profile:', error);
@@ -293,27 +252,530 @@ Click "Open App" to view your library!
   }
 });
 
+// =====================
+// TELEGRAM BOT - ADMIN UPLOAD COMMANDS
+// =====================
+
+// Upload command
+bot.onText(/\/upload/, async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id.toString();
+  
+  try {
+    const user = await User.findOne({ telegramId: userId });
+    if (!user || !user.isAdmin || !user.hasPermission('uploadContent')) {
+      return bot.sendMessage(chatId, '❌ You do not have permission to upload content.');
+    }
+
+    // Initialize upload state
+    tempUploads[userId] = {
+      step: 'file',
+      data: {}
+    };
+
+    const uploadMenu = `
+📤 *Upload New Content*
+
+*Step 1 of 4: Send the file*
+
+Please send the video or photo file you want to upload.
+
+Supported formats:
+📹 Video: MP4, WebM
+🖼️ Photo: JPEG, PNG, GIF
+
+Type /cancel to cancel the upload.
+    `;
+
+    bot.sendMessage(chatId, uploadMenu, { parse_mode: 'Markdown' });
+  } catch (error) {
+    console.error('Error in /upload:', error);
+    bot.sendMessage(chatId, '❌ Something went wrong. Please try again.');
+  }
+});
+
+// Cancel upload
+bot.onText(/\/cancel/, async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id.toString();
+  
+  if (tempUploads[userId]) {
+    delete tempUploads[userId];
+    bot.sendMessage(chatId, '✅ Upload cancelled.');
+  } else {
+    bot.sendMessage(chatId, 'ℹ️ No active upload to cancel.');
+  }
+});
+
+// Handle all messages for upload process
+bot.on('message', async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id.toString();
+  
+  // Ignore commands
+  if (msg.text && msg.text.startsWith('/')) return;
+  
+  try {
+    // Check if user has active upload
+    if (!tempUploads[userId]) return;
+    
+    const uploadState = tempUploads[userId];
+    const user = await User.findOne({ telegramId: userId });
+    
+    if (!user) return;
+
+    switch (uploadState.step) {
+      case 'file':
+        await handleFileUpload(msg, user, chatId);
+        break;
+      case 'title':
+        await handleTitleInput(msg, user, chatId);
+        break;
+      case 'description':
+        await handleDescriptionInput(msg, user, chatId);
+        break;
+      case 'category':
+        await handleCategoryInput(msg, user, chatId);
+        break;
+      case 'price':
+        await handlePriceInput(msg, user, chatId);
+        break;
+    }
+  } catch (error) {
+    console.error('Error handling message:', error);
+    bot.sendMessage(chatId, '❌ Something went wrong. Please try again.');
+  }
+});
+
+// Handle file upload
+async function handleFileUpload(msg, user, chatId) {
+  const userId = user.telegramId;
+  const file = msg.video || msg.photo || msg.document;
+  
+  if (!file) {
+    return bot.sendMessage(chatId, '❌ Please send a valid video or photo file.');
+  }
+
+  try {
+    let fileId, fileType, fileName, mimeType;
+    
+    // Determine file type
+    if (msg.video) {
+      fileId = msg.video.file_id;
+      fileType = 'video';
+      mimeType = msg.video.mime_type || 'video/mp4';
+      fileName = `video_${Date.now()}.mp4`;
+    } else if (msg.photo) {
+      // Get the largest photo
+      const photo = msg.photo[msg.photo.length - 1];
+      fileId = photo.file_id;
+      fileType = 'photo';
+      mimeType = 'image/jpeg';
+      fileName = `photo_${Date.now()}.jpg`;
+    } else if (msg.document) {
+      const doc = msg.document;
+      const mimeType = doc.mime_type || '';
+      if (mimeType.startsWith('video/')) {
+        fileId = doc.file_id;
+        fileType = 'video';
+        fileName = doc.file_name || `video_${Date.now()}.mp4`;
+      } else if (mimeType.startsWith('image/')) {
+        fileId = doc.file_id;
+        fileType = 'photo';
+        fileName = doc.file_name || `photo_${Date.now()}.jpg`;
+      } else {
+        return bot.sendMessage(chatId, '❌ Unsupported file type. Please send a video or photo.');
+      }
+    } else {
+      return bot.sendMessage(chatId, '❌ Unsupported file type. Please send a video or photo.');
+    }
+
+    // Get file from Telegram
+    const fileLink = await bot.getFile(fileId);
+    const fileUrl = `https://api.telegram.org/file/bot${process.env.BOT_TOKEN}/${fileLink.file_path}`;
+
+    // Download file
+    const response = await axios({
+      method: 'get',
+      url: fileUrl,
+      responseType: 'stream'
+    });
+
+    // Save file locally
+    const uploadDir = 'uploads/';
+    if (!fs.existsSync(uploadDir)) {
+      fs.mkdirSync(uploadDir, { recursive: true });
+    }
+
+    const uniqueFilename = Date.now() + '-' + Math.round(Math.random() * 1E9) + path.extname(fileName);
+    const filePath = path.join(uploadDir, uniqueFilename);
+    
+    const writer = fs.createWriteStream(filePath);
+    response.data.pipe(writer);
+
+    await new Promise((resolve, reject) => {
+      writer.on('finish', resolve);
+      writer.on('error', reject);
+    });
+
+    // Store file info in temp
+    tempUploads[userId].data = {
+      ...tempUploads[userId].data,
+      file: uniqueFilename,
+      fileType: fileType,
+      fileName: fileName
+    };
+
+    // Move to next step
+    tempUploads[userId].step = 'title';
+    
+    const titlePrompt = `
+✅ File received successfully!
+
+*Step 2 of 4: Enter Title*
+
+Please send the title for this content.
+
+Example: "Amazing Ethiopian Music Video"
+
+Type /cancel to cancel the upload.
+    `;
+    
+    bot.sendMessage(chatId, titlePrompt, { parse_mode: 'Markdown' });
+    
+  } catch (error) {
+    console.error('File download error:', error);
+    bot.sendMessage(chatId, '❌ Failed to download file. Please try again.');
+    delete tempUploads[userId];
+  }
+}
+
+// Handle title input
+async function handleTitleInput(msg, user, chatId) {
+  const userId = user.telegramId;
+  const title = msg.text;
+  
+  if (!title || title.length < 3) {
+    return bot.sendMessage(chatId, '❌ Title must be at least 3 characters long. Please try again.');
+  }
+
+  tempUploads[userId].data.title = title;
+  tempUploads[userId].step = 'description';
+
+  const descPrompt = `
+✅ Title saved: *${title}*
+
+*Step 3 of 4: Enter Description*
+
+Please send a description for this content.
+
+Example: "This is an amazing video about Ethiopian culture..."
+
+Type /cancel to cancel the upload.
+  `;
+  
+  bot.sendMessage(chatId, descPrompt, { parse_mode: 'Markdown' });
+}
+
+// Handle description input
+async function handleDescriptionInput(msg, user, chatId) {
+  const userId = user.telegramId;
+  const description = msg.text;
+  
+  tempUploads[userId].data.description = description || '';
+  tempUploads[userId].step = 'category';
+
+  const categoryPrompt = `
+✅ Description saved!
+
+*Step 4 of 6: Select Category*
+
+Please choose a category by sending the number:
+
+1️⃣ Music
+2️⃣ Movies
+3️⃣ Sports
+4️⃣ Culture
+5️⃣ News
+
+Type /cancel to cancel the upload.
+  `;
+  
+  bot.sendMessage(chatId, categoryPrompt, { parse_mode: 'Markdown' });
+}
+
+// Handle category input
+async function handleCategoryInput(msg, user, chatId) {
+  const userId = user.telegramId;
+  const input = msg.text;
+  
+  const categories = {
+    '1': 'music',
+    '2': 'movies',
+    '3': 'sports',
+    '4': 'culture',
+    '5': 'news'
+  };
+
+  const category = categories[input];
+  
+  if (!category) {
+    return bot.sendMessage(chatId, '❌ Invalid category. Please send a number from 1 to 5.');
+  }
+
+  tempUploads[userId].data.category = category;
+  tempUploads[userId].step = 'price';
+
+  const pricePrompt = `
+✅ Category selected: *${category}*
+
+*Step 5 of 6: Enter Price*
+
+Please enter the price in USD:
+
+💰 Enter a number (e.g., 5.99)
+🆓 Enter 0 for free content
+
+Type /cancel to cancel the upload.
+  `;
+  
+  bot.sendMessage(chatId, pricePrompt, { parse_mode: 'Markdown' });
+}
+
+// Handle price input
+async function handlePriceInput(msg, user, chatId) {
+  const userId = user.telegramId;
+  const input = msg.text;
+  
+  const price = parseFloat(input);
+  
+  if (isNaN(price) || price < 0) {
+    return bot.sendMessage(chatId, '❌ Invalid price. Please enter a valid number (e.g., 5.99).');
+  }
+
+  tempUploads[userId].data.price = price;
+  tempUploads[userId].step = 'confirm';
+
+  // Show confirmation
+  const data = tempUploads[userId].data;
+  const confirmMessage = `
+📋 *Review Your Upload*
+
+Please review the information below:
+
+📌 *Title:* ${data.title}
+📝 *Description:* ${data.description || 'No description'}
+📂 *Type:* ${data.fileType}
+🏷️ *Category:* ${data.category}
+💰 *Price:* $${price.toFixed(2)}
+
+Is this information correct?
+
+Press ✅ Yes to confirm and upload
+Press ❌ No to cancel
+
+Type /cancel to cancel the upload.
+  `;
+
+  const options = {
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: '✅ Yes, Upload', callback_data: 'confirm_upload' },
+          { text: '❌ No, Cancel', callback_data: 'cancel_upload' }
+        ]
+      ]
+    },
+    parse_mode: 'Markdown'
+  };
+
+  bot.sendMessage(chatId, confirmMessage, options);
+}
+
+// Handle callback queries for upload confirmation
 bot.on('callback_query', async (callbackQuery) => {
   const msg = callbackQuery.message;
+  const chatId = msg.chat.id;
+  const userId = callbackQuery.from.id.toString();
   const data = callbackQuery.data;
 
   if (data === 'help') {
     const helpMessage = `
-📚 Help & Support
+📚 *Help & Support*
 
 How to use Habesha:
-1. Click "Open App" to start
-2. Browse content in Videos & Photos
-3. Tap on content to see details
-4. Purchase to unlock full access
-5. View your purchases in "My Library"
+1️⃣ Click "Open App" to start
+2️⃣ Browse content in Videos & Photos
+3️⃣ Tap on content to see details
+4️⃣ Purchase to unlock full access
+5️⃣ View your purchases in "My Library"
+
+*Admin Commands:*
+/upload - Upload new content
+/cancel - Cancel current upload
 
 For support: @habesha_support
     `;
-    bot.sendMessage(msg.chat.id, helpMessage);
+    bot.sendMessage(msg.chat.id, helpMessage, { parse_mode: 'Markdown' });
+    return bot.answerCallbackQuery(callbackQuery.id);
+  }
+
+  if (data === 'upload') {
+    // Trigger upload command
+    bot.emit('text', { chat: { id: chatId }, from: { id: userId }, text: '/upload' });
+    return bot.answerCallbackQuery(callbackQuery.id);
+  }
+
+  // Handle upload confirmation
+  if (data === 'confirm_upload') {
+    await confirmUpload(userId, chatId);
+    return bot.answerCallbackQuery(callbackQuery.id);
+  }
+
+  if (data === 'cancel_upload') {
+    if (tempUploads[userId]) {
+      delete tempUploads[userId];
+      bot.sendMessage(chatId, '❌ Upload cancelled.');
+    }
+    return bot.answerCallbackQuery(callbackQuery.id);
   }
 
   bot.answerCallbackQuery(callbackQuery.id);
+});
+
+// Confirm and save upload
+async function confirmUpload(userId, chatId) {
+  try {
+    if (!tempUploads[userId]) {
+      return bot.sendMessage(chatId, '❌ No upload in progress.');
+    }
+
+    const data = tempUploads[userId].data;
+    const user = await User.findOne({ telegramId: userId });
+
+    if (!user) {
+      return bot.sendMessage(chatId, '❌ User not found.');
+    }
+
+    // Create media in database
+    const media = new Media({
+      title: data.title,
+      description: data.description || '',
+      type: data.fileType,
+      category: data.category,
+      price: data.price,
+      file: data.file,
+      thumbnail: data.file,
+      uploadedBy: user._id,
+      isPublished: true
+    });
+
+    await media.save();
+
+    // Clear temp upload
+    delete tempUploads[userId];
+
+    // Success message
+    const successMessage = `
+✅ *Upload Successful!*
+
+Your content has been uploaded successfully.
+
+📌 *Title:* ${data.title}
+📂 *Type:* ${data.fileType}
+🏷️ *Category:* ${data.category}
+💰 *Price:* $${data.price.toFixed(2)}
+
+The content is now available in the app!
+
+Click the button below to view it in the app.
+    `;
+
+    const options = {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '📱 Open App', web_app: { url: process.env.APP_URL } }]
+        ]
+      },
+      parse_mode: 'Markdown'
+    };
+
+    bot.sendMessage(chatId, successMessage, options);
+
+    // Notify all admins about new upload
+    const admins = await User.find({ isAdmin: true });
+    for (const admin of admins) {
+      try {
+        await bot.sendMessage(admin.telegramId,
+          `📹 *New Content Uploaded*\n\n` +
+          `📌 Title: ${data.title}\n` +
+          `📂 Type: ${data.fileType}\n` +
+          `🏷️ Category: ${data.category}\n` +
+          `💰 Price: $${data.price.toFixed(2)}\n` +
+          `👤 Uploaded by: ${user.name}\n\n` +
+          `View in app: ${process.env.APP_URL}`,
+          { parse_mode: 'Markdown' }
+        );
+      } catch (error) {
+        console.error('Failed to notify admin:', error);
+      }
+    }
+
+  } catch (error) {
+    console.error('Confirm upload error:', error);
+    bot.sendMessage(chatId, '❌ Failed to save upload. Please try again.');
+    delete tempUploads[userId];
+  }
+}
+
+// =====================
+// ROOT ROUTE
+// =====================
+
+app.get('/', (req, res) => {
+  res.json({
+    name: 'Habesha API',
+    version: '1.0.0',
+    status: 'running',
+    endpoints: {
+      auth: '/api/auth/telegram',
+      media: '/api/media',
+      purchases: '/api/purchases',
+      admin: '/api/admin',
+      docs: '/api/docs'
+    }
+  });
+});
+
+// API Documentation Route
+app.get('/api/docs', (req, res) => {
+  res.json({
+    endpoints: {
+      'POST /api/auth/telegram': 'Authenticate user with Telegram',
+      'GET /api/media': 'Get all media content',
+      'GET /api/media/:id': 'Get single media by ID',
+      'POST /api/purchase/initiate': 'Initiate purchase',
+      'POST /api/purchase/verify': 'Verify payment',
+      'GET /api/purchases': 'Get user purchases',
+      'POST /api/admin/media': 'Upload media (Admin)',
+      'PUT /api/admin/media/:id': 'Update media (Admin)',
+      'DELETE /api/admin/media/:id': 'Delete media (Admin)',
+      'GET /api/admin/stats': 'Get admin stats (Admin)',
+      'GET /api/admin/users': 'Get users (Admin)',
+      'PUT /api/admin/users/:userId/ban': 'Ban/Unban user (Admin)',
+      'GET /api/admin/admins': 'Get all admins (Admin)',
+      'POST /api/admin/admins': 'Add admin (Admin)',
+      'PUT /api/admin/admins/:adminId': 'Update admin (Admin)',
+      'DELETE /api/admin/admins/:adminId': 'Remove admin (Admin)',
+      'POST /api/admin/broadcast': 'Send broadcast (Admin)'
+    },
+    admin_roles: {
+      super_admin: 'Full access to everything',
+      content_manager: 'Manage content and view analytics',
+      moderator: 'Delete and edit content',
+      support: 'Manage users only'
+    }
+  });
 });
 
 // =====================
@@ -1071,6 +1533,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🚀 Habesha Server running on port ${PORT}`);
   console.log(`📊 Admin IDs: ${ADMIN_IDS.join(', ')}`);
-  console.log(`📝 API Docs: https://habeshan-hub.onrender.com:${PORT}/api/docs`);
-  console.log(`🏠 Home: https://habeshan-hub.onrender.com:${PORT}`);
+  console.log(`📝 API Docs: http://localhost:${PORT}/api/docs`);
+  console.log(`🏠 Home: http://localhost:${PORT}`);
+  console.log(`🤖 Bot is running...`);
 });

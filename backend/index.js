@@ -20,11 +20,18 @@ const Transaction = require('./models/Transaction');
 const app = express();
 
 // Middleware
-app.use(helmet());
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: "cross-origin" }
+}));
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
+
+// Serve static files
 app.use('/uploads', express.static('uploads'));
+
+// Serve frontend static files if they exist
+app.use(express.static(path.join(__dirname, '../frontend')));
 
 // Rate limiting
 const limiter = rateLimit({
@@ -40,15 +47,15 @@ const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 mongoose.connect(process.env.MONGO_URI, {
   useNewUrlParser: true,
   useUnifiedTopology: true
-}).then(() => console.log('MongoDB connected'))
-  .catch(err => console.log('MongoDB connection error:', err));
+}).then(() => console.log('✅ MongoDB connected'))
+  .catch(err => console.log('❌ MongoDB connection error:', err));
 
 // File upload configuration
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     const uploadDir = 'uploads/';
     if (!fs.existsSync(uploadDir)) {
-      fs.mkdirSync(uploadDir);
+      fs.mkdirSync(uploadDir, { recursive: true });
     }
     cb(null, uploadDir);
   },
@@ -73,6 +80,56 @@ const upload = multer({
 
 // Admin IDs from .env
 const ADMIN_IDS = process.env.ADMIN_IDS ? process.env.ADMIN_IDS.split(',').map(id => id.trim()) : [];
+
+// =====================
+// ROOT ROUTE
+// =====================
+
+app.get('/', (req, res) => {
+  res.json({
+    name: 'Habesha API',
+    version: '1.0.0',
+    status: 'running',
+    endpoints: {
+      auth: '/api/auth/telegram',
+      media: '/api/media',
+      purchases: '/api/purchases',
+      admin: '/api/admin',
+      docs: '/api/docs'
+    }
+  });
+});
+
+// API Documentation Route
+app.get('/api/docs', (req, res) => {
+  res.json({
+    endpoints: {
+      'POST /api/auth/telegram': 'Authenticate user with Telegram',
+      'GET /api/media': 'Get all media content',
+      'GET /api/media/:id': 'Get single media by ID',
+      'POST /api/purchase/initiate': 'Initiate purchase',
+      'POST /api/purchase/verify': 'Verify payment',
+      'GET /api/purchases': 'Get user purchases',
+      'POST /api/admin/media': 'Upload media (Admin)',
+      'PUT /api/admin/media/:id': 'Update media (Admin)',
+      'DELETE /api/admin/media/:id': 'Delete media (Admin)',
+      'GET /api/admin/stats': 'Get admin stats (Admin)',
+      'GET /api/admin/users': 'Get users (Admin)',
+      'PUT /api/admin/users/:userId/ban': 'Ban/Unban user (Admin)',
+      'GET /api/admin/admins': 'Get all admins (Admin)',
+      'POST /api/admin/admins': 'Add admin (Admin)',
+      'PUT /api/admin/admins/:adminId': 'Update admin (Admin)',
+      'DELETE /api/admin/admins/:adminId': 'Remove admin (Admin)',
+      'POST /api/admin/broadcast': 'Send broadcast (Admin)'
+    },
+    admin_roles: {
+      super_admin: 'Full access to everything',
+      content_manager: 'Manage content and view analytics',
+      moderator: 'Delete and edit content',
+      support: 'Manage users only'
+    }
+  });
+});
 
 // =====================
 // AUTHENTICATION MIDDLEWARE
@@ -135,25 +192,26 @@ bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id.toString();
   
-  let user = await User.findOne({ telegramId: userId });
-  if (!user) {
-    const isAdmin = ADMIN_IDS.includes(userId);
-    user = new User({
-      telegramId: userId,
-      username: msg.from.username || '',
-      name: msg.from.first_name || '',
-      isAdmin: isAdmin,
-      adminRole: isAdmin ? 'super_admin' : null
-    });
-    
-    if (isAdmin) {
-      user.adminPermissions = User.getAdminPermissions('super_admin');
+  try {
+    let user = await User.findOne({ telegramId: userId });
+    if (!user) {
+      const isAdmin = ADMIN_IDS.includes(userId);
+      user = new User({
+        telegramId: userId,
+        username: msg.from.username || '',
+        name: msg.from.first_name || '',
+        isAdmin: isAdmin,
+        adminRole: isAdmin ? 'super_admin' : null
+      });
+      
+      if (isAdmin) {
+        user.adminPermissions = User.getAdminPermissions('super_admin');
+      }
+      
+      await user.save();
     }
-    
-    await user.save();
-  }
 
-  const welcomeMessage = `
+    const welcomeMessage = `
 🎬 Welcome to Habesha!
 
 Discover amazing Ethiopian content - videos, photos, and more!
@@ -164,18 +222,22 @@ Discover amazing Ethiopian content - videos, photos, and more!
 📱 Watch anytime
 
 Click the button below to open the app!
-  `;
+    `;
 
-  const options = {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: '🚀 Open App', web_app: { url: process.env.APP_URL } }],
-        [{ text: 'ℹ️ Help', callback_data: 'help' }]
-      ]
-    }
-  };
+    const options = {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '🚀 Open App', web_app: { url: process.env.APP_URL } }],
+          [{ text: 'ℹ️ Help', callback_data: 'help' }]
+        ]
+      }
+    };
 
-  bot.sendMessage(chatId, welcomeMessage, options);
+    bot.sendMessage(chatId, welcomeMessage, options);
+  } catch (error) {
+    console.error('Error in /start:', error);
+    bot.sendMessage(chatId, '❌ Something went wrong. Please try again.');
+  }
 });
 
 bot.onText(/\/help/, async (msg) => {
@@ -199,13 +261,14 @@ bot.onText(/\/profile/, async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id.toString();
   
-  const user = await User.findOne({ telegramId: userId });
-  if (!user) {
-    return bot.sendMessage(chatId, 'Please start the app first: /start');
-  }
+  try {
+    const user = await User.findOne({ telegramId: userId });
+    if (!user) {
+      return bot.sendMessage(chatId, 'Please start the app first: /start');
+    }
 
-  const purchases = await Purchase.find({ userId: user._id });
-  const profileMessage = `
+    const purchases = await Purchase.find({ userId: user._id });
+    const profileMessage = `
 👤 Profile
 
 Name: ${user.name}
@@ -215,15 +278,19 @@ Member Since: ${new Date(user.createdAt).toLocaleDateString()}
 ${user.isAdmin ? `\n🔑 Admin: ${user.adminRole}` : ''}
 
 Click "Open App" to view your library!
-  `;
+    `;
 
-  bot.sendMessage(chatId, profileMessage, {
-    reply_markup: {
-      inline_keyboard: [
-        [{ text: '📱 Open App', web_app: { url: process.env.APP_URL } }]
-      ]
-    }
-  });
+    bot.sendMessage(chatId, profileMessage, {
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '📱 Open App', web_app: { url: process.env.APP_URL } }]
+        ]
+      }
+    });
+  } catch (error) {
+    console.error('Error in /profile:', error);
+    bot.sendMessage(chatId, '❌ Something went wrong. Please try again.');
+  }
 });
 
 bot.on('callback_query', async (callbackQuery) => {
@@ -257,13 +324,17 @@ app.post('/api/auth/telegram', async (req, res) => {
   try {
     const { telegramId, username, name } = req.body;
     
+    if (!telegramId) {
+      return res.status(400).json({ error: 'Telegram ID is required' });
+    }
+
     let user = await User.findOne({ telegramId });
     if (!user) {
       const isAdmin = ADMIN_IDS.includes(telegramId);
       user = new User({
         telegramId,
         username: username || '',
-        name: name || '',
+        name: name || 'User',
         isAdmin: isAdmin,
         adminRole: isAdmin ? 'super_admin' : null
       });
@@ -282,6 +353,7 @@ app.post('/api/auth/telegram', async (req, res) => {
     );
 
     res.json({
+      success: true,
       token,
       user: {
         id: user._id,
@@ -319,6 +391,10 @@ app.post('/api/admin/admins', authenticate, checkAdminPermission('manageAdmins')
   try {
     const { telegramId, name, role, customPermissions } = req.body;
     
+    if (!telegramId) {
+      return res.status(400).json({ error: 'Telegram ID is required' });
+    }
+
     let user = await User.findOne({ telegramId });
     
     if (!user) {
@@ -677,7 +753,11 @@ app.post('/api/admin/media', authenticate, checkAdminPermission('uploadContent')
       }
     }
 
-    res.status(201).json(media);
+    res.status(201).json({
+      success: true,
+      message: 'Content uploaded successfully',
+      media
+    });
   } catch (error) {
     console.error('Upload error:', error);
     res.status(500).json({ error: 'Upload failed' });
@@ -697,7 +777,11 @@ app.put('/api/admin/media/:id', authenticate, checkAdminPermission('editContent'
       return res.status(404).json({ error: 'Media not found' });
     }
 
-    res.json(media);
+    res.json({
+      success: true,
+      message: 'Content updated successfully',
+      media
+    });
   } catch (error) {
     console.error('Update error:', error);
     res.status(500).json({ error: 'Update failed' });
@@ -719,7 +803,10 @@ app.delete('/api/admin/media/:id', authenticate, checkAdminPermission('deleteCon
     }
 
     await media.remove();
-    res.json({ success: true });
+    res.json({
+      success: true,
+      message: 'Content deleted successfully'
+    });
   } catch (error) {
     console.error('Delete error:', error);
     res.status(500).json({ error: 'Delete failed' });
@@ -764,7 +851,6 @@ app.post('/api/purchase/initiate', authenticate, async (req, res) => {
         $addToSet: { purchases: mediaId }
       });
 
-      // Notify admins
       const admins = await User.find({ isAdmin: true });
       for (const admin of admins) {
         try {
@@ -829,7 +915,6 @@ app.post('/api/purchase/verify', authenticate, async (req, res) => {
         $addToSet: { purchases: purchase.mediaId }
       });
 
-      // Notify admins
       const admins = await User.find({ isAdmin: true });
       for (const admin of admins) {
         try {
@@ -895,13 +980,16 @@ app.get('/api/admin/stats', authenticate, checkAdminPermission('viewAnalytics'),
       .sort({ views: -1 })
       .limit(5);
 
+    const adminCount = await User.countDocuments({ isAdmin: true });
+
     res.json({
       totalUsers,
       totalMedia,
       totalPurchases,
       totalEarnings: totalEarnings[0]?.total || 0,
       recentPurchases,
-      topContent
+      topContent,
+      adminCount
     });
   } catch (error) {
     console.error('Stats error:', error);
@@ -917,6 +1005,10 @@ app.post('/api/admin/broadcast', authenticate, checkAdminPermission('broadcastMe
   try {
     const { message, targetUsers = 'all', targetAdmins = false } = req.body;
     
+    if (!message) {
+      return res.status(400).json({ error: 'Message is required' });
+    }
+
     const query = { banned: false };
     if (targetAdmins) {
       query.isAdmin = true;
@@ -949,12 +1041,26 @@ app.post('/api/admin/broadcast', authenticate, checkAdminPermission('broadcastMe
 });
 
 // =====================
+// 404 HANDLER
+// =====================
+
+app.use((req, res) => {
+  res.status(404).json({ 
+    error: 'Endpoint not found',
+    message: 'Please check the API documentation at /api/docs'
+  });
+});
+
+// =====================
 // ERROR HANDLING
 // =====================
 
 app.use((err, req, res, next) => {
   console.error('Error:', err);
-  res.status(500).json({ error: 'Internal server error' });
+  res.status(500).json({ 
+    error: 'Internal server error',
+    message: err.message 
+  });
 });
 
 // =====================
@@ -963,6 +1069,8 @@ app.use((err, req, res, next) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`🚀 Habesha Server running on port ${PORT}`);
   console.log(`📊 Admin IDs: ${ADMIN_IDS.join(', ')}`);
+  console.log(`📝 API Docs: https://habeshan-hub.onrender.com:${PORT}/api/docs`);
+  console.log(`🏠 Home: https://habeshan-hub.onrender.com:${PORT}`);
 });

@@ -1,7 +1,7 @@
 {
   "name": "habesha-backend",
   "version": "1.0.0",
-  "description": "Habesha Telegram Mini App Backend",
+  "description": "Habesha Telegram Mini App Backend with Multi-Admin Support",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
@@ -23,4 +23,4 @@
   "devDependencies": {
     "nodemon": "^2.0.22"
   }
-} 
+}

@@ -5,9 +5,13 @@ const transactionSchema = new mongoose.Schema({
     type: mongoose.Schema.Types.ObjectId,
     ref: 'User'
   },
+  adminId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: 'User'
+  },
   type: {
     type: String,
-    enum: ['purchase', 'refund', 'admin_adjustment']
+    enum: ['purchase', 'refund', 'admin_adjustment', 'withdrawal']
   },
   amount: {
     type: Number,

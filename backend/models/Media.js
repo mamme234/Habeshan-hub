@@ -16,7 +16,8 @@ const mediaSchema = new mongoose.Schema({
   },
   category: {
     type: String,
-    required: true
+    required: true,
+    enum: ['music', 'movies', 'sports', 'culture', 'news']
   },
   price: {
     type: Number,

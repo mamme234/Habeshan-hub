@@ -6,10 +6,15 @@ const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
 const jwt = require('jsonwebtoken');
-const bcrypt = require('bcryptjs');
 const TelegramBot = require('node-telegram-bot-api');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+
+// Import Models
+const User = require('./models/User');
+const Media = require('./models/Media');
+const Purchase = require('./models/Purchase');
+const Transaction = require('./models/Transaction');
 
 // Initialize Express
 const app = express();
@@ -23,19 +28,13 @@ app.use('/uploads', express.static('uploads'));
 
 // Rate limiting
 const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
+  windowMs: 15 * 60 * 1000,
   max: 100
 });
 app.use('/api/', limiter);
 
 // Initialize Telegram Bot
 const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
-
-// Database Models
-const User = require('./models/User');
-const Media = require('./models/Media');
-const Purchase = require('./models/Purchase');
-const Transaction = require('./models/Transaction');
 
 // Connect to MongoDB
 mongoose.connect(process.env.MONGO_URI, {
@@ -61,9 +60,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({ 
   storage: storage,
-  limits: {
-    fileSize: 100 * 1024 * 1024 // 100MB limit
-  },
+  limits: { fileSize: 100 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     const allowedTypes = ['image/jpeg', 'image/png', 'image/gif', 'video/mp4', 'video/webm'];
     if (allowedTypes.includes(file.mimetype)) {
@@ -74,7 +71,13 @@ const upload = multer({
   }
 });
 
-// Authentication middleware
+// Admin IDs from .env
+const ADMIN_IDS = process.env.ADMIN_IDS ? process.env.ADMIN_IDS.split(',').map(id => id.trim()) : [];
+
+// =====================
+// AUTHENTICATION MIDDLEWARE
+// =====================
+
 const authenticate = async (req, res, next) => {
   try {
     const token = req.headers.authorization?.split(' ')[1];
@@ -89,18 +92,39 @@ const authenticate = async (req, res, next) => {
       return res.status(401).json({ error: 'User not found' });
     }
 
+    if (user.banned) {
+      if (user.bannedUntil && new Date() < user.bannedUntil) {
+        return res.status(403).json({ 
+          error: 'Account is banned',
+          bannedUntil: user.bannedUntil
+        });
+      } else if (user.bannedUntil && new Date() >= user.bannedUntil) {
+        user.banned = false;
+        user.bannedUntil = null;
+        await user.save();
+      }
+    }
+
     req.user = user;
     next();
   } catch (error) {
+    console.error('Auth error:', error);
     return res.status(401).json({ error: 'Invalid token' });
   }
 };
 
-const isAdmin = (req, res, next) => {
-  if (!req.user.isAdmin) {
-    return res.status(403).json({ error: 'Admin access required' });
-  }
-  next();
+const checkAdminPermission = (permission) => {
+  return (req, res, next) => {
+    if (!req.user || !req.user.isAdmin) {
+      return res.status(403).json({ error: 'Admin access required' });
+    }
+    
+    if (!req.user.hasPermission(permission)) {
+      return res.status(403).json({ error: `Insufficient permissions: ${permission} required` });
+    }
+    
+    next();
+  };
 };
 
 // =====================
@@ -109,17 +133,23 @@ const isAdmin = (req, res, next) => {
 
 bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
-  const userId = msg.from.id;
+  const userId = msg.from.id.toString();
   
-  // Check if user exists
   let user = await User.findOne({ telegramId: userId });
   if (!user) {
+    const isAdmin = ADMIN_IDS.includes(userId);
     user = new User({
       telegramId: userId,
       username: msg.from.username || '',
       name: msg.from.first_name || '',
-      isAdmin: userId.toString() === process.env.ADMIN_ID
+      isAdmin: isAdmin,
+      adminRole: isAdmin ? 'super_admin' : null
     });
+    
+    if (isAdmin) {
+      user.adminPermissions = User.getAdminPermissions('super_admin');
+    }
+    
     await user.save();
   }
 
@@ -167,7 +197,7 @@ For support: @habesha_support
 
 bot.onText(/\/profile/, async (msg) => {
   const chatId = msg.chat.id;
-  const userId = msg.from.id;
+  const userId = msg.from.id.toString();
   
   const user = await User.findOne({ telegramId: userId });
   if (!user) {
@@ -182,6 +212,7 @@ Name: ${user.name}
 Username: @${user.username || 'Not set'}
 Total Purchases: ${purchases.length}
 Member Since: ${new Date(user.createdAt).toLocaleDateString()}
+${user.isAdmin ? `\n🔑 Admin: ${user.adminRole}` : ''}
 
 Click "Open App" to view your library!
   `;
@@ -219,22 +250,28 @@ For support: @habesha_support
 });
 
 // =====================
-// API ENDPOINTS
+// AUTH ENDPOINTS
 // =====================
 
-// Auth endpoints
 app.post('/api/auth/telegram', async (req, res) => {
   try {
     const { telegramId, username, name } = req.body;
     
     let user = await User.findOne({ telegramId });
     if (!user) {
+      const isAdmin = ADMIN_IDS.includes(telegramId);
       user = new User({
         telegramId,
         username: username || '',
         name: name || '',
-        isAdmin: telegramId.toString() === process.env.ADMIN_ID
+        isAdmin: isAdmin,
+        adminRole: isAdmin ? 'super_admin' : null
       });
+      
+      if (isAdmin) {
+        user.adminPermissions = User.getAdminPermissions('super_admin');
+      }
+      
       await user.save();
     }
 
@@ -250,7 +287,9 @@ app.post('/api/auth/telegram', async (req, res) => {
         id: user._id,
         name: user.name,
         username: user.username,
-        isAdmin: user.isAdmin
+        isAdmin: user.isAdmin,
+        adminRole: user.adminRole,
+        permissions: user.adminPermissions
       }
     });
   } catch (error) {
@@ -259,7 +298,270 @@ app.post('/api/auth/telegram', async (req, res) => {
   }
 });
 
-// Media endpoints
+// =====================
+// ADMIN MANAGEMENT ENDPOINTS
+// =====================
+
+app.get('/api/admin/admins', authenticate, checkAdminPermission('manageAdmins'), async (req, res) => {
+  try {
+    const admins = await User.find({ isAdmin: true })
+      .select('-__v')
+      .sort({ createdAt: -1 });
+    
+    res.json(admins);
+  } catch (error) {
+    console.error('Error fetching admins:', error);
+    res.status(500).json({ error: 'Failed to fetch admins' });
+  }
+});
+
+app.post('/api/admin/admins', authenticate, checkAdminPermission('manageAdmins'), async (req, res) => {
+  try {
+    const { telegramId, name, role, customPermissions } = req.body;
+    
+    let user = await User.findOne({ telegramId });
+    
+    if (!user) {
+      user = new User({
+        telegramId,
+        username: req.body.username || '',
+        name: name || 'Admin User',
+        isAdmin: true,
+        adminRole: role || 'content_manager'
+      });
+    } else {
+      user.isAdmin = true;
+      user.adminRole = role || 'content_manager';
+    }
+    
+    const defaultPermissions = User.getAdminPermissions(user.adminRole);
+    user.adminPermissions = customPermissions || defaultPermissions;
+    
+    await user.save();
+    
+    try {
+      await bot.sendMessage(telegramId, 
+        `🎉 You have been made an admin on Habesha!\n\n` +
+        `Role: ${user.adminRole}\n` +
+        `Permissions: ${Object.keys(user.adminPermissions).filter(p => user.adminPermissions[p]).join(', ')}\n\n` +
+        `Open the app to access admin features.`
+      );
+    } catch (error) {
+      console.error('Failed to notify new admin:', error);
+    }
+    
+    const superAdmins = await User.find({ adminRole: 'super_admin' });
+    for (const admin of superAdmins) {
+      try {
+        await bot.sendMessage(admin.telegramId,
+          `👤 New admin added\n` +
+          `User: ${user.name} (@${user.username})\n` +
+          `Role: ${user.adminRole}\n` +
+          `Added by: ${req.user.name}`
+        );
+      } catch (error) {
+        console.error('Failed to notify super admin:', error);
+      }
+    }
+    
+    res.status(201).json({
+      success: true,
+      message: 'Admin added successfully',
+      admin: user
+    });
+  } catch (error) {
+    console.error('Error adding admin:', error);
+    res.status(500).json({ error: 'Failed to add admin' });
+  }
+});
+
+app.put('/api/admin/admins/:adminId', authenticate, checkAdminPermission('manageAdmins'), async (req, res) => {
+  try {
+    const { adminId } = req.params;
+    const { role, permissions } = req.body;
+    
+    if (adminId === req.user._id.toString() && role !== 'super_admin') {
+      return res.status(400).json({ error: 'Cannot demote yourself' });
+    }
+    
+    const admin = await User.findById(adminId);
+    if (!admin || !admin.isAdmin) {
+      return res.status(404).json({ error: 'Admin not found' });
+    }
+    
+    if (admin.adminRole === 'super_admin' && req.user.adminRole !== 'super_admin') {
+      return res.status(403).json({ error: 'Cannot modify super admin' });
+    }
+    
+    if (role) {
+      admin.adminRole = role;
+      const defaultPermissions = User.getAdminPermissions(role);
+      admin.adminPermissions = permissions || defaultPermissions;
+    } else if (permissions) {
+      admin.adminPermissions = permissions;
+    }
+    
+    await admin.save();
+    
+    try {
+      await bot.sendMessage(admin.telegramId,
+        `🔄 Your admin permissions have been updated\n\n` +
+        `Role: ${admin.adminRole}\n` +
+        `Permissions: ${Object.keys(admin.adminPermissions).filter(p => admin.adminPermissions[p]).join(', ')}`
+      );
+    } catch (error) {
+      console.error('Failed to notify admin:', error);
+    }
+    
+    res.json({
+      success: true,
+      message: 'Admin updated successfully',
+      admin
+    });
+  } catch (error) {
+    console.error('Error updating admin:', error);
+    res.status(500).json({ error: 'Failed to update admin' });
+  }
+});
+
+app.delete('/api/admin/admins/:adminId', authenticate, checkAdminPermission('manageAdmins'), async (req, res) => {
+  try {
+    const { adminId } = req.params;
+    
+    if (adminId === req.user._id.toString()) {
+      return res.status(400).json({ error: 'Cannot remove yourself' });
+    }
+    
+    const admin = await User.findById(adminId);
+    if (!admin || !admin.isAdmin) {
+      return res.status(404).json({ error: 'Admin not found' });
+    }
+    
+    if (admin.adminRole === 'super_admin' && req.user.adminRole !== 'super_admin') {
+      return res.status(403).json({ error: 'Cannot remove super admin' });
+    }
+    
+    admin.isAdmin = false;
+    admin.adminRole = null;
+    admin.adminPermissions = {};
+    await admin.save();
+    
+    try {
+      await bot.sendMessage(admin.telegramId,
+        `⚠️ Your admin privileges have been removed from Habesha.\n\n` +
+        `You can still use the app as a regular user.`
+      );
+    } catch (error) {
+      console.error('Failed to notify removed admin:', error);
+    }
+    
+    res.json({
+      success: true,
+      message: 'Admin removed successfully'
+    });
+  } catch (error) {
+    console.error('Error removing admin:', error);
+    res.status(500).json({ error: 'Failed to remove admin' });
+  }
+});
+
+// =====================
+// USER MANAGEMENT ENDPOINTS
+// =====================
+
+app.get('/api/admin/users', authenticate, checkAdminPermission('manageUsers'), async (req, res) => {
+  try {
+    const { search, isAdmin, banned, limit = 50, skip = 0 } = req.query;
+    
+    const query = {};
+    if (search) {
+      query.$or = [
+        { name: { $regex: search, $options: 'i' } },
+        { username: { $regex: search, $options: 'i' } },
+        { telegramId: { $regex: search, $options: 'i' } }
+      ];
+    }
+    if (isAdmin !== undefined) query.isAdmin = isAdmin === 'true';
+    if (banned !== undefined) query.banned = banned === 'true';
+    
+    const users = await User.find(query)
+      .select('-__v')
+      .sort({ createdAt: -1 })
+      .skip(parseInt(skip))
+      .limit(parseInt(limit));
+    
+    const total = await User.countDocuments(query);
+    
+    res.json({
+      users,
+      pagination: {
+        total,
+        limit: parseInt(limit),
+        skip: parseInt(skip)
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching users:', error);
+    res.status(500).json({ error: 'Failed to fetch users' });
+  }
+});
+
+app.put('/api/admin/users/:userId/ban', authenticate, checkAdminPermission('manageUsers'), async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { ban, duration = 7, reason = '' } = req.body;
+    
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    if (user.isAdmin) {
+      return res.status(400).json({ error: 'Cannot ban an admin' });
+    }
+    
+    user.banned = ban;
+    if (ban) {
+      user.bannedUntil = new Date(Date.now() + duration * 24 * 60 * 60 * 1000);
+    } else {
+      user.bannedUntil = null;
+    }
+    await user.save();
+    
+    try {
+      if (ban) {
+        await bot.sendMessage(user.telegramId,
+          `⛔ You have been banned from Habesha\n\n` +
+          `Reason: ${reason || 'Violation of terms of service'}\n` +
+          `Duration: ${duration} days\n` +
+          `Until: ${user.bannedUntil.toLocaleDateString()}\n\n` +
+          `Contact support for more information.`
+        );
+      } else {
+        await bot.sendMessage(user.telegramId,
+          `✅ Your account has been unbanned\n\n` +
+          `You can now access Habesha again.`
+        );
+      }
+    } catch (error) {
+      console.error('Failed to notify user:', error);
+    }
+    
+    res.json({
+      success: true,
+      message: `User ${ban ? 'banned' : 'unbanned'} successfully`,
+      user
+    });
+  } catch (error) {
+    console.error('Error toggling user ban:', error);
+    res.status(500).json({ error: 'Failed to toggle user ban' });
+  }
+});
+
+// =====================
+// MEDIA ENDPOINTS
+// =====================
+
 app.get('/api/media', async (req, res) => {
   try {
     const { type, category, search } = req.query;
@@ -278,7 +580,6 @@ app.get('/api/media', async (req, res) => {
       .sort({ createdAt: -1 })
       .limit(50);
 
-    // Add purchase status for each media
     const userId = req.user?._id;
     const mediaWithStatus = await Promise.all(media.map(async (item) => {
       const isPurchased = userId ? await Purchase.findOne({ 
@@ -308,7 +609,6 @@ app.get('/api/media/:id', async (req, res) => {
       return res.status(404).json({ error: 'Media not found' });
     }
 
-    // Increment view count
     media.views += 1;
     await media.save();
 
@@ -335,7 +635,101 @@ app.get('/api/media/:id', async (req, res) => {
   }
 });
 
-// Purchase endpoints
+// =====================
+// CONTENT MANAGEMENT ENDPOINTS (Admin)
+// =====================
+
+app.post('/api/admin/media', authenticate, checkAdminPermission('uploadContent'), upload.single('file'), async (req, res) => {
+  try {
+    const { title, description, type, category, price } = req.body;
+    
+    if (!req.file) {
+      return res.status(400).json({ error: 'File is required' });
+    }
+
+    const media = new Media({
+      title,
+      description,
+      type,
+      category,
+      price: parseFloat(price) || 0,
+      file: req.file.filename,
+      thumbnail: req.file.filename,
+      uploadedBy: req.user._id
+    });
+
+    await media.save();
+
+    // Notify all admins
+    const admins = await User.find({ isAdmin: true });
+    for (const admin of admins) {
+      try {
+        await bot.sendMessage(admin.telegramId, 
+          `📹 New content uploaded\n` +
+          `Title: ${title}\n` +
+          `Type: ${type}\n` +
+          `Category: ${category}\n` +
+          `Price: $${price || 0}\n` +
+          `Uploaded by: ${req.user.name}`
+        );
+      } catch (error) {
+        console.error('Failed to notify admin:', error);
+      }
+    }
+
+    res.status(201).json(media);
+  } catch (error) {
+    console.error('Upload error:', error);
+    res.status(500).json({ error: 'Upload failed' });
+  }
+});
+
+app.put('/api/admin/media/:id', authenticate, checkAdminPermission('editContent'), async (req, res) => {
+  try {
+    const { title, description, price, isPublished } = req.body;
+    const media = await Media.findByIdAndUpdate(
+      req.params.id,
+      { title, description, price, isPublished },
+      { new: true }
+    );
+
+    if (!media) {
+      return res.status(404).json({ error: 'Media not found' });
+    }
+
+    res.json(media);
+  } catch (error) {
+    console.error('Update error:', error);
+    res.status(500).json({ error: 'Update failed' });
+  }
+});
+
+app.delete('/api/admin/media/:id', authenticate, checkAdminPermission('deleteContent'), async (req, res) => {
+  try {
+    const media = await Media.findById(req.params.id);
+    if (!media) {
+      return res.status(404).json({ error: 'Media not found' });
+    }
+
+    if (media.file) {
+      const filePath = path.join(__dirname, 'uploads', media.file);
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+      }
+    }
+
+    await media.remove();
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Delete error:', error);
+    res.status(500).json({ error: 'Delete failed' });
+  }
+});
+
+// =====================
+// PURCHASE ENDPOINTS
+// =====================
+
 app.post('/api/purchase/initiate', authenticate, async (req, res) => {
   try {
     const { mediaId } = req.body;
@@ -346,7 +740,6 @@ app.post('/api/purchase/initiate', authenticate, async (req, res) => {
       return res.status(404).json({ error: 'Media not found' });
     }
 
-    // Check if already purchased
     const existingPurchase = await Purchase.findOne({
       userId,
       mediaId,
@@ -358,7 +751,6 @@ app.post('/api/purchase/initiate', authenticate, async (req, res) => {
     }
 
     if (media.price === 0) {
-      // Free content - just create purchase record
       const purchase = new Purchase({
         userId,
         mediaId,
@@ -368,18 +760,27 @@ app.post('/api/purchase/initiate', authenticate, async (req, res) => {
       });
       await purchase.save();
 
-      // Notify admin
-      const adminUser = await User.findOne({ isAdmin: true });
-      if (adminUser) {
-        bot.sendMessage(adminUser.telegramId, 
-          `📥 New free content accessed\nUser: ${req.user.name}\nContent: ${media.title}`
-        );
+      await User.findByIdAndUpdate(userId, {
+        $addToSet: { purchases: mediaId }
+      });
+
+      // Notify admins
+      const admins = await User.find({ isAdmin: true });
+      for (const admin of admins) {
+        try {
+          await bot.sendMessage(admin.telegramId, 
+            `📥 Free content accessed\n` +
+            `User: ${req.user.name}\n` +
+            `Content: ${media.title}`
+          );
+        } catch (error) {
+          console.error('Failed to notify admin:', error);
+        }
       }
 
       return res.json({ success: true, free: true });
     }
 
-    // Paid content - create pending purchase
     const purchase = new Purchase({
       userId,
       mediaId,
@@ -389,7 +790,6 @@ app.post('/api/purchase/initiate', authenticate, async (req, res) => {
     });
     await purchase.save();
 
-    // Generate payment URL (simplified - integrate with actual payment provider)
     const paymentUrl = `${process.env.APP_URL}/payment/${purchase._id}`;
 
     res.json({
@@ -417,8 +817,7 @@ app.post('/api/purchase/verify', authenticate, async (req, res) => {
       return res.json({ success: true });
     }
 
-    // Verify payment (integrate with actual payment gateway)
-    // For now, we'll simulate verification
+    // Simulate payment verification
     const isVerified = true;
 
     if (isVerified) {
@@ -426,18 +825,24 @@ app.post('/api/purchase/verify', authenticate, async (req, res) => {
       purchase.paymentId = paymentId || 'verified_' + Date.now();
       await purchase.save();
 
-      // Add to user's purchases
       await User.findByIdAndUpdate(userId, {
         $addToSet: { purchases: purchase.mediaId }
       });
 
-      // Notify admin
-      const adminUser = await User.findOne({ isAdmin: true });
-      if (adminUser) {
-        const media = await Media.findById(purchase.mediaId);
-        bot.sendMessage(adminUser.telegramId, 
-          `💰 New purchase\nUser: ${req.user.name}\nContent: ${media.title}\nAmount: ${purchase.amount}`
-        );
+      // Notify admins
+      const admins = await User.find({ isAdmin: true });
+      for (const admin of admins) {
+        try {
+          const media = await Media.findById(purchase.mediaId);
+          await bot.sendMessage(admin.telegramId, 
+            `💰 New purchase\n` +
+            `User: ${req.user.name}\n` +
+            `Content: ${media.title}\n` +
+            `Amount: $${purchase.amount}`
+          );
+        } catch (error) {
+          console.error('Failed to notify admin:', error);
+        }
       }
 
       res.json({ success: true });
@@ -466,85 +871,11 @@ app.get('/api/purchases', authenticate, async (req, res) => {
   }
 });
 
-// Admin endpoints
-app.post('/api/admin/media', authenticate, isAdmin, upload.single('file'), async (req, res) => {
-  try {
-    const { title, description, type, category, price } = req.body;
-    
-    // Validate file
-    if (!req.file) {
-      return res.status(400).json({ error: 'File is required' });
-    }
+// =====================
+// STATS ENDPOINTS
+// =====================
 
-    const media = new Media({
-      title,
-      description,
-      type,
-      category,
-      price: parseFloat(price) || 0,
-      file: req.file.filename,
-      thumbnail: req.file.filename, // In production, generate actual thumbnail
-      uploadedBy: req.user._id
-    });
-
-    await media.save();
-
-    // Notify admin
-    bot.sendMessage(process.env.ADMIN_ID, 
-      `✅ New content uploaded\nTitle: ${title}\nType: ${type}\nPrice: ${price}`
-    );
-
-    res.status(201).json(media);
-  } catch (error) {
-    console.error('Upload error:', error);
-    res.status(500).json({ error: 'Upload failed' });
-  }
-});
-
-app.put('/api/admin/media/:id', authenticate, isAdmin, async (req, res) => {
-  try {
-    const { title, description, price, isPublished } = req.body;
-    const media = await Media.findByIdAndUpdate(
-      req.params.id,
-      { title, description, price, isPublished },
-      { new: true }
-    );
-
-    if (!media) {
-      return res.status(404).json({ error: 'Media not found' });
-    }
-
-    res.json(media);
-  } catch (error) {
-    console.error('Update error:', error);
-    res.status(500).json({ error: 'Update failed' });
-  }
-});
-
-app.delete('/api/admin/media/:id', authenticate, isAdmin, async (req, res) => {
-  try {
-    const media = await Media.findById(req.params.id);
-    if (!media) {
-      return res.status(404).json({ error: 'Media not found' });
-    }
-
-    // Delete file from filesystem
-    if (media.file) {
-      const filePath = path.join(__dirname, 'uploads', media.file);
-      if (fs.existsSync(filePath)) {
-        fs.unlinkSync(filePath);
-      }
-    }
-
-    await media.remove();
-    res.json({ success: true });
-  } catch (error) {
-    console.error('Delete error:', error);
-    res.status(500).json({ error: 'Delete failed' });
-  }
-});
-
-app.get('/api/admin/stats', authenticate, isAdmin, async (req, res) => {
+app.get('/api/admin/stats', authenticate, checkAdminPermission('viewAnalytics'), async (req, res) => {
   try {
     const totalUsers = await User.countDocuments();
     const totalMedia = await Media.countDocuments();
@@ -560,12 +891,17 @@ app.get('/api/admin/stats', authenticate, isAdmin, async (req, res) => {
       .sort({ createdAt: -1 })
       .limit(10);
 
+    const topContent = await Media.find()
+      .sort({ views: -1 })
+      .limit(5);
+
     res.json({
       totalUsers,
       totalMedia,
       totalPurchases,
       totalEarnings: totalEarnings[0]?.total || 0,
-      recentPurchases
+      recentPurchases,
+      topContent
     });
   } catch (error) {
     console.error('Stats error:', error);
@@ -573,11 +909,20 @@ app.get('/api/admin/stats', authenticate, isAdmin, async (req, res) => {
   }
 });
 
-app.post('/api/admin/broadcast', authenticate, isAdmin, async (req, res) => {
+// =====================
+// BROADCAST ENDPOINTS
+// =====================
+
+app.post('/api/admin/broadcast', authenticate, checkAdminPermission('broadcastMessages'), async (req, res) => {
   try {
-    const { message } = req.body;
+    const { message, targetUsers = 'all', targetAdmins = false } = req.body;
     
-    const users = await User.find({});
+    const query = { banned: false };
+    if (targetAdmins) {
+      query.isAdmin = true;
+    }
+    
+    const users = await User.find(query);
     let sentCount = 0;
 
     for (const user of users) {
@@ -586,26 +931,38 @@ app.post('/api/admin/broadcast', authenticate, isAdmin, async (req, res) => {
           `📢 Announcement from Habesha\n\n${message}`
         );
         sentCount++;
+        await new Promise(resolve => setTimeout(resolve, 100));
       } catch (error) {
         console.error(`Failed to send to user ${user.telegramId}:`, error);
       }
     }
 
-    res.json({ success: true, sentCount });
+    res.json({ 
+      success: true, 
+      sentCount,
+      totalTargeted: users.length
+    });
   } catch (error) {
     console.error('Broadcast error:', error);
     res.status(500).json({ error: 'Broadcast failed' });
   }
 });
 
-// Start server
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
+// =====================
+// ERROR HANDLING
+// =====================
 
-// Error handling middleware
 app.use((err, req, res, next) => {
   console.error('Error:', err);
   res.status(500).json({ error: 'Internal server error' });
+});
+
+// =====================
+// START SERVER
+// =====================
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📊 Admin IDs: ${ADMIN_IDS.join(', ')}`);
 });

@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Habesha - Ethiopian Content</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+    <!-- Splash Screen -->
+    <div id="splash" class="active">
+        <div class="splash-content">
+            <div class="logo">🎬</div>
+            <h1>Habesha</h1>
+            <p>Ethiopian Content Hub</p>
+            <div class="loader"></div>
+        </div>
+    </div>
+
+    <!-- Main App -->
+    <div id="app">
+        <!-- Header -->
+        <header>
+            <div class="header-left">
+                <button id="menuBtn" class="icon-btn"><i class="fas fa-bars"></i></button>
+                <h2>Habesha</h2>
+            </div>
+            <div class="header-right">
+                <button id="searchBtn" class="icon-btn"><i class="fas fa-search"></i></button>
+                <button id="notificationBtn" class="icon-btn"><i class="fas fa-bell"></i></button>
+            </div>
+        </header>
+
+        <!-- Search Bar -->
+        <div id="searchBar" class="search-bar hidden">
+            <input type="text" id="searchInput" placeholder="Search content...">
+            <button id="searchClose"><i class="fas fa-times"></i></button>
+        </div>
+
+        <!-- Navigation -->
+        <nav class="bottom-nav">
+            <button class="nav-item active" data-page="home">
+                <i class="fas fa-home"></i>
+                <span>Home</span>
+            </button>
+            <button class="nav-item" data-page="videos">
+                <i class="fas fa-video"></i>
+                <span>Videos</span>
+            </button>
+            <button class="nav-item" data-page="photos">
+                <i class="fas fa-image"></i>
+                <span>Photos</span>
+            </button>
+            <button class="nav-item" data-page="library">
+                <i class="fas fa-book"></i>
+                <span>Library</span>
+            </button>
+            <button class="nav-item" data-page="profile">
+                <i class="fas fa-user"></i>
+                <span>Profile</span>
+            </button>
+        </nav>
+
+        <!-- Pages -->
+        <main>
+            <!-- Home Page -->
+            <section id="homePage" class="page active">
+                <div class="page-header">
+                    <h1>Welcome to Habesha</h1>
+                    <p>Discover amazing Ethiopian content</p>
+                </div>
+                <div class="categories">
+                    <button class="category-btn active" data-category="all">All</button>
+                    <button class="category-btn" data-category="music">Music</button>
+                    <button class="category-btn" data-category="movies">Movies</button>
+                    <button class="category-btn" data-category="sports">Sports</button>
+                    <button class="category-btn" data-category="culture">Culture</button>
+                    <button class="category-btn" data-category="news">News</button>
+                </div>
+                <div id="homeContent" class="content-grid"></div>
+            </section>
+
+            <!-- Videos Page -->
+            <section id="videosPage" class="page">
+                <div class="page-header">
+                    <h1>Videos</h1>
+                    <p>Watch premium Ethiopian videos</p>
+                </div>
+                <div id="videosContent" class="content-grid"></div>
+            </section>
+
+            <!-- Photos Page -->
+            <section id="photosPage" class="page">
+                <div class="page-header">
+                    <h1>Photos</h1>
+                    <p>Explore stunning Ethiopian photography</p>
+                </div>
+                <div id="photosContent" class="photo-grid"></div>
+            </section>
+
+            <!-- Library Page -->
+            <section id="libraryPage" class="page">
+                <div class="page-header">
+                    <h1>My Library</h1>
+                    <p>Your purchased content</p>
+                </div>
+                <div id="libraryContent" class="content-grid"></div>
+            </section>
+
+            <!-- Profile Page -->
+            <section id="profilePage" class="page">
+                <div class="profile-card">
+                    <div class="profile-avatar">
+                        <i class="fas fa-user-circle"></i>
+                    </div>
+                    <h2 id="profileName">User Name</h2>
+                    <p id="profileUsername">@username</p>
+                    <div class="profile-stats">
+                        <div class="stat">
+                            <span class="stat-value" id="purchaseCount">0</span>
+                            <span class="stat-label">Purchases</span>
+                        </div>
+                        <div class="stat">
+                            <span class="stat-value" id="favoriteCount">0</span>
+                            <span class="stat-label">Favorites</span>
+                        </div>
+                    </div>
+                    <button id="logoutBtn" class="btn btn-danger">Logout</button>
+                </div>
+                <div id="profileContent"></div>
+            </section>
+
+            <!-- Admin Dashboard -->
+            <section id="adminPage" class="page">
+                <div class="page-header">
+                    <h1>Admin Dashboard</h1>
+                    <p>Manage your content</p>
+                </div>
+                <div class="admin-stats">
+                    <div class="stat-card">
+                        <i class="fas fa-users"></i>
+                        <span class="stat-value" id="totalUsers">0</span>
+                        <span class="stat-label">Total Users</span>
+                    </div>
+                    <div class="stat-card">
+                        <i class="fas fa-video"></i>
+                        <span class="stat-value" id="totalMedia">0</span>
+                        <span class="stat-label">Total Media</span>
+                    </div>
+                    <div class="stat-card">
+                        <i class="fas fa-shopping-cart"></i>
+                        <span class="stat-value" id="totalPurchases">0</span>
+                        <span class="stat-label">Total Purchases</span>
+                    </div>
+                    <div class="stat-card">
+                        <i class="fas fa-dollar-sign"></i>
+                        <span class="stat-value" id="totalEarnings">0</span>
+                        <span class="stat-label">Total Earnings</span>
+                    </div>
+                </div>
+                <div class="admin-actions">
+                    <button id="uploadBtn" class="btn btn-primary"><i class="fas fa-upload"></i> Upload Content</button>
+                    <button id="broadcastBtn" class="btn btn-secondary"><i class="fas fa-bullhorn"></i> Broadcast</button>
+                </div>
+                <div id="adminContent"></div>
+            </section>
+        </main>
+    </div>
+
+    <!-- Modals -->
+    <!-- Content Detail Modal -->
+    <div id="contentModal" class="modal">
+        <div class="modal-content">
+            <button class="modal-close"><i class="fas fa-times"></i></button>
+            <div id="modalContent"></div>
+        </div>
+    </div>
+
+    <!-- Upload Modal -->
+    <div id="uploadModal" class="modal">
+        <div class="modal-content">
+            <button class="modal-close"><i class="fas fa-times"></i></button>
+            <h2>Upload Content</h2>
+            <form id="uploadForm">
+                <div class="form-group">
+                    <label>Title</label>
+                    <input type="text" id="uploadTitle" required>
+                </div>
+                <div class="form-group">
+                    <label>Description</label>
+                    <textarea id="uploadDescription"></textarea>
+                </div>
+                <div class="form-group">
+                    <label>Type</label>
+                    <select id="uploadType">
+                        <option value="video">Video</option>
+                        <option value="photo">Photo</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Category</label>
+                    <select id="uploadCategory">
+                        <option value="music">Music</option>
+                        <option value="movies">Movies</option>
+                        <option value="sports">Sports</option>
+                        <option value="culture">Culture</option>
+                        <option value="news">News</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Price ($)</label>
+                    <input type="number" id="uploadPrice" step="0.01" value="0">
+                </div>
+                <div class="form-group">
+                    <label>File</label>
+                    <input type="file" id="uploadFile" accept="video/*,image/*" required>
+                </div>
+                <button type="submit" class="btn btn-primary">Upload</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- Broadcast Modal -->
+    <div id="broadcastModal" class="modal">
+        <div class="modal-content">
+            <button class="modal-close"><i class="fas fa-times"></i></button>
+            <h2>Broadcast Message</h2>
+            <form id="broadcastForm">
+                <div class="form-group">
+                    <label>Message</label>
+                    <textarea id="broadcastMessage" required rows="5"></textarea>
+                </div>
+                <button type="submit" class="btn btn-secondary">Send Broadcast</button>
+            </form>
+        </div>
+    </div>
+
+    <!-- Payment Modal -->
+    <div id="paymentModal" class="modal">
+        <div class="modal-content">
+            <button class="modal-close"><i class="fas fa-times"></i></button>
+            <div id="paymentContent"></div>
+        </div>
+    </div>
+
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    <script src="app.js"></script>
+</body>
+  </html>

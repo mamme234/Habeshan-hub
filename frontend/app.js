@@ -1,6 +1,6 @@
 // Habesha Telegram Mini App - Frontend JavaScript
 
-const API_URL = 'https://your-api-url.com'; // Replace with your actual API URL
+const API_URL = 'https://habeshan-hub.onrender.com'; // Replace with your actual API URL
 
 // App State
 const state = {

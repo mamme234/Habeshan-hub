@@ -16,6 +16,7 @@ const User = require('./models/User');
 const Media = require('./models/Media');
 const Purchase = require('./models/Purchase');
 const Transaction = require('./models/Transaction');
+const AdminConfig = require('./models/AdminConfig');
 
 // Initialize Express
 const app = express();
@@ -80,8 +81,9 @@ const upload = multer({
 // Admin IDs from .env
 const ADMIN_IDS = process.env.ADMIN_IDS ? process.env.ADMIN_IDS.split(',').map(id => id.trim()) : [];
 
-// Temporary upload storage for bot uploads
+// Temporary storage
 const tempUploads = {};
+const tempTelebirrConfig = {};
 
 // =====================
 // AUTHENTICATION MIDDLEWARE
@@ -163,6 +165,14 @@ bot.onText(/\/start/, async (msg) => {
       await user.save();
     }
 
+    let adminButtons = [];
+    if (user.isAdmin) {
+      adminButtons = [
+        [{ text: '📤 Upload Content', callback_data: 'upload' }],
+        [{ text: '📱 Set Telebirr', callback_data: 'setuptelebirr' }]
+      ];
+    }
+
     const welcomeMessage = `
 🎬 *Welcome to Habesha!*
 
@@ -181,7 +191,7 @@ Click the button below to open the app!
         inline_keyboard: [
           [{ text: '🚀 Open App', web_app: { url: process.env.APP_URL } }],
           [{ text: 'ℹ️ Help', callback_data: 'help' }],
-          ...(user.isAdmin ? [[{ text: '📤 Upload Content', callback_data: 'upload' }]] : [])
+          ...adminButtons
         ]
       },
       parse_mode: 'Markdown'
@@ -208,6 +218,8 @@ How to use Habesha:
 
 *Admin Commands:*
 /upload - Upload new content
+/setuptelebirr - Set up Telebirr configuration
+/viewtelebirr - View your Telebirr configuration
 /cancel - Cancel current upload
 
 For support: @habesha_support
@@ -253,10 +265,9 @@ Click "Open App" to view your library!
 });
 
 // =====================
-// TELEGRAM BOT - ADMIN UPLOAD COMMANDS
+// TELEGRAM BOT - UPLOAD SYSTEM
 // =====================
 
-// Upload command
 bot.onText(/\/upload/, async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id.toString();
@@ -267,7 +278,6 @@ bot.onText(/\/upload/, async (msg) => {
       return bot.sendMessage(chatId, '❌ You do not have permission to upload content.');
     }
 
-    // Initialize upload state
     tempUploads[userId] = {
       step: 'file',
       data: {}
@@ -276,7 +286,7 @@ bot.onText(/\/upload/, async (msg) => {
     const uploadMenu = `
 📤 *Upload New Content*
 
-*Step 1 of 4: Send the file*
+*Step 1 of 6: Send the file*
 
 Please send the video or photo file you want to upload.
 
@@ -294,7 +304,6 @@ Type /cancel to cancel the upload.
   }
 });
 
-// Cancel upload
 bot.onText(/\/cancel/, async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id.toString();
@@ -302,44 +311,61 @@ bot.onText(/\/cancel/, async (msg) => {
   if (tempUploads[userId]) {
     delete tempUploads[userId];
     bot.sendMessage(chatId, '✅ Upload cancelled.');
+  } else if (tempTelebirrConfig[userId]) {
+    delete tempTelebirrConfig[userId];
+    bot.sendMessage(chatId, '✅ Telebirr setup cancelled.');
   } else {
-    bot.sendMessage(chatId, 'ℹ️ No active upload to cancel.');
+    bot.sendMessage(chatId, 'ℹ️ No active operation to cancel.');
   }
 });
 
-// Handle all messages for upload process
+// Handle messages for upload and Telebirr setup
 bot.on('message', async (msg) => {
   const chatId = msg.chat.id;
   const userId = msg.from.id.toString();
   
-  // Ignore commands
   if (msg.text && msg.text.startsWith('/')) return;
   
   try {
-    // Check if user has active upload
-    if (!tempUploads[userId]) return;
-    
-    const uploadState = tempUploads[userId];
-    const user = await User.findOne({ telegramId: userId });
-    
-    if (!user) return;
+    // Check for upload
+    if (tempUploads[userId]) {
+      const uploadState = tempUploads[userId];
+      const user = await User.findOne({ telegramId: userId });
+      if (!user) return;
 
-    switch (uploadState.step) {
-      case 'file':
-        await handleFileUpload(msg, user, chatId);
-        break;
-      case 'title':
-        await handleTitleInput(msg, user, chatId);
-        break;
-      case 'description':
-        await handleDescriptionInput(msg, user, chatId);
-        break;
-      case 'category':
-        await handleCategoryInput(msg, user, chatId);
-        break;
-      case 'price':
-        await handlePriceInput(msg, user, chatId);
-        break;
+      switch (uploadState.step) {
+        case 'file':
+          await handleFileUpload(msg, user, chatId);
+          break;
+        case 'title':
+          await handleTitleInput(msg, user, chatId);
+          break;
+        case 'description':
+          await handleDescriptionInput(msg, user, chatId);
+          break;
+        case 'category':
+          await handleCategoryInput(msg, user, chatId);
+          break;
+        case 'price':
+          await handlePriceInput(msg, user, chatId);
+          break;
+      }
+      return;
+    }
+
+    // Check for Telebirr setup
+    if (tempTelebirrConfig[userId]) {
+      const config = tempTelebirrConfig[userId];
+      
+      switch (config.step) {
+        case 'number':
+          await handleTelebirrNumber(msg, userId, chatId);
+          break;
+        case 'password':
+          await handleTelebirrPassword(msg, userId, chatId);
+          break;
+      }
+      return;
     }
   } catch (error) {
     console.error('Error handling message:', error);
@@ -347,7 +373,10 @@ bot.on('message', async (msg) => {
   }
 });
 
-// Handle file upload
+// =====================
+// UPLOAD HANDLERS
+// =====================
+
 async function handleFileUpload(msg, user, chatId) {
   const userId = user.telegramId;
   const file = msg.video || msg.photo || msg.document;
@@ -359,14 +388,12 @@ async function handleFileUpload(msg, user, chatId) {
   try {
     let fileId, fileType, fileName, mimeType;
     
-    // Determine file type
     if (msg.video) {
       fileId = msg.video.file_id;
       fileType = 'video';
       mimeType = msg.video.mime_type || 'video/mp4';
       fileName = `video_${Date.now()}.mp4`;
     } else if (msg.photo) {
-      // Get the largest photo
       const photo = msg.photo[msg.photo.length - 1];
       fileId = photo.file_id;
       fileType = 'photo';
@@ -390,18 +417,15 @@ async function handleFileUpload(msg, user, chatId) {
       return bot.sendMessage(chatId, '❌ Unsupported file type. Please send a video or photo.');
     }
 
-    // Get file from Telegram
     const fileLink = await bot.getFile(fileId);
     const fileUrl = `https://api.telegram.org/file/bot${process.env.BOT_TOKEN}/${fileLink.file_path}`;
 
-    // Download file
     const response = await axios({
       method: 'get',
       url: fileUrl,
       responseType: 'stream'
     });
 
-    // Save file locally
     const uploadDir = 'uploads/';
     if (!fs.existsSync(uploadDir)) {
       fs.mkdirSync(uploadDir, { recursive: true });
@@ -418,7 +442,6 @@ async function handleFileUpload(msg, user, chatId) {
       writer.on('error', reject);
     });
 
-    // Store file info in temp
     tempUploads[userId].data = {
       ...tempUploads[userId].data,
       file: uniqueFilename,
@@ -426,13 +449,12 @@ async function handleFileUpload(msg, user, chatId) {
       fileName: fileName
     };
 
-    // Move to next step
     tempUploads[userId].step = 'title';
     
     const titlePrompt = `
 ✅ File received successfully!
 
-*Step 2 of 4: Enter Title*
+*Step 2 of 6: Enter Title*
 
 Please send the title for this content.
 
@@ -450,7 +472,6 @@ Type /cancel to cancel the upload.
   }
 }
 
-// Handle title input
 async function handleTitleInput(msg, user, chatId) {
   const userId = user.telegramId;
   const title = msg.text;
@@ -465,7 +486,7 @@ async function handleTitleInput(msg, user, chatId) {
   const descPrompt = `
 ✅ Title saved: *${title}*
 
-*Step 3 of 4: Enter Description*
+*Step 3 of 6: Enter Description*
 
 Please send a description for this content.
 
@@ -477,7 +498,6 @@ Type /cancel to cancel the upload.
   bot.sendMessage(chatId, descPrompt, { parse_mode: 'Markdown' });
 }
 
-// Handle description input
 async function handleDescriptionInput(msg, user, chatId) {
   const userId = user.telegramId;
   const description = msg.text;
@@ -504,7 +524,6 @@ Type /cancel to cancel the upload.
   bot.sendMessage(chatId, categoryPrompt, { parse_mode: 'Markdown' });
 }
 
-// Handle category input
 async function handleCategoryInput(msg, user, chatId) {
   const userId = user.telegramId;
   const input = msg.text;
@@ -542,7 +561,6 @@ Type /cancel to cancel the upload.
   bot.sendMessage(chatId, pricePrompt, { parse_mode: 'Markdown' });
 }
 
-// Handle price input
 async function handlePriceInput(msg, user, chatId) {
   const userId = user.telegramId;
   const input = msg.text;
@@ -550,13 +568,12 @@ async function handlePriceInput(msg, user, chatId) {
   const price = parseFloat(input);
   
   if (isNaN(price) || price < 0) {
-    return bot.sendMessage(chatId, '❌ Invalid price. Please enter a valid number (e.g., 5.99).');
+    return bot.sendMessage(chatId, '❌ Invalid price. Please enter a valid number.');
   }
 
   tempUploads[userId].data.price = price;
   tempUploads[userId].step = 'confirm';
 
-  // Show confirmation
   const data = tempUploads[userId].data;
   const confirmMessage = `
 📋 *Review Your Upload*
@@ -592,13 +609,231 @@ Type /cancel to cancel the upload.
   bot.sendMessage(chatId, confirmMessage, options);
 }
 
-// Handle callback queries for upload confirmation
+// =====================
+// TELEBIRR CONFIGURATION HANDLERS
+// =====================
+
+bot.onText(/\/setuptelebirr/, async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id.toString();
+  
+  try {
+    const user = await User.findOne({ telegramId: userId });
+    if (!user || !user.isAdmin) {
+      return bot.sendMessage(chatId, '❌ Only admins can set up Telebirr configuration.');
+    }
+
+    const existingConfig = await AdminConfig.findOne({ telegramId: userId });
+    
+    if (existingConfig) {
+      const statusEmoji = existingConfig.status === 'approved' ? '✅' : 
+                          existingConfig.status === 'rejected' ? '❌' : '⏳';
+      
+      const confirmMessage = `
+⚠️ *You already have a Telebirr configuration.*
+
+📱 *Number:* ${existingConfig.telebirrNumber}
+🔐 *Password:* ${'•'.repeat(existingConfig.telebirrPassword.length)}
+📊 *Status:* ${statusEmoji} ${existingConfig.status.toUpperCase()}
+
+Do you want to update your configuration?
+
+Press ✅ Yes to update
+Press ❌ No to keep current
+      `;
+
+      const options = {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '✅ Yes, Update', callback_data: 'update_telebirr' },
+              { text: '❌ No, Keep', callback_data: 'keep_telebirr' }
+            ]
+          ]
+        },
+        parse_mode: 'Markdown'
+      };
+
+      return bot.sendMessage(chatId, confirmMessage, options);
+    }
+
+    tempTelebirrConfig[userId] = {
+      step: 'number',
+      data: {}
+    };
+
+    const setupMessage = `
+📱 *Telebirr Configuration Setup*
+
+*Step 1 of 2: Enter Telebirr Number*
+
+Please enter your Telebirr phone number.
+
+Format: 09XXXXXXXX
+
+⚠️ *Note:* Your configuration will be verified. You will receive a confirmation message after approval.
+
+Type /cancel to cancel the setup.
+    `;
+
+    bot.sendMessage(chatId, setupMessage, { parse_mode: 'Markdown' });
+
+  } catch (error) {
+    console.error('Error in /setuptelebirr:', error);
+    bot.sendMessage(chatId, '❌ Something went wrong. Please try again.');
+  }
+});
+
+async function handleTelebirrNumber(msg, userId, chatId) {
+  const number = msg.text;
+  
+  const phoneRegex = /^09\d{8}$/;
+  if (!phoneRegex.test(number)) {
+    return bot.sendMessage(chatId, '❌ Invalid phone number. Please use format: 09XXXXXXXX');
+  }
+
+  tempTelebirrConfig[userId].data.number = number;
+  tempTelebirrConfig[userId].step = 'password';
+
+  const passwordMessage = `
+🔐 *Step 2 of 2: Enter Telebirr Password*
+
+Please enter your Telebirr account password.
+
+⚠️ *Note:* Your password is encrypted and will be verified. You will receive confirmation after approval.
+
+Type /cancel to cancel the setup.
+  `;
+
+  bot.sendMessage(chatId, passwordMessage, { parse_mode: 'Markdown' });
+}
+
+async function handleTelebirrPassword(msg, userId, chatId) {
+  const password = msg.text;
+  
+  if (!password || password.length < 4) {
+    return bot.sendMessage(chatId, '❌ Password must be at least 4 characters long.');
+  }
+
+  const user = await User.findOne({ telegramId: userId });
+  
+  const config = new AdminConfig({
+    adminId: user._id,
+    telegramId: userId,
+    adminName: user.name,
+    telebirrNumber: tempTelebirrConfig[userId].data.number,
+    telebirrPassword: password,
+    status: 'pending'
+  });
+
+  await config.save();
+
+  delete tempTelebirrConfig[userId];
+
+  // Notify the admin (not telling them about main admin)
+  const successMessage = `
+✅ *Telebirr Configuration Submitted!*
+
+📱 *Number:* ${config.telebirrNumber}
+📊 *Status:* ⏳ Pending Verification
+
+You will receive a confirmation message once your configuration is verified.
+
+Thank you for your patience! 🙏
+  `;
+
+  bot.sendMessage(chatId, successMessage, { parse_mode: 'Markdown' });
+
+  // Notify ALL super admins (hidden from regular admin)
+  const superAdmins = await User.find({ adminRole: 'super_admin' });
+  
+  for (const superAdmin of superAdmins) {
+    try {
+      const approveOptions = {
+        reply_markup: {
+          inline_keyboard: [
+            [
+              { text: '✅ Approve', callback_data: `approve_telebirr_${config._id}` },
+              { text: '❌ Reject', callback_data: `reject_telebirr_${config._id}` }
+            ]
+          ]
+        },
+        parse_mode: 'Markdown'
+      };
+
+      await bot.sendMessage(
+        superAdmin.telegramId,
+        `🔔 *New Telebirr Configuration Request*
+
+👤 *Admin:* ${user.name} (@${user.username || 'N/A'})
+📱 *Telegram ID:* ${userId}
+📞 *Telebirr Number:* ${config.telebirrNumber}
+🔐 *Password:* ${'•'.repeat(config.telebirrPassword.length)}
+📅 *Requested:* ${new Date().toLocaleString()}
+
+Please review and approve or reject this configuration.`,
+        approveOptions
+      );
+    } catch (error) {
+      console.error('Failed to notify super admin:', error);
+    }
+  }
+}
+
+bot.onText(/\/viewtelebirr/, async (msg) => {
+  const chatId = msg.chat.id;
+  const userId = msg.from.id.toString();
+  
+  try {
+    const user = await User.findOne({ telegramId: userId });
+    if (!user || !user.isAdmin) {
+      return bot.sendMessage(chatId, '❌ Only admins can view Telebirr configuration.');
+    }
+
+    const config = await AdminConfig.findOne({ telegramId: userId });
+    
+    if (!config) {
+      return bot.sendMessage(chatId, 
+        `ℹ️ You haven't set up Telebirr configuration yet.\n\n` +
+        `Use /setuptelebirr to set up your configuration.`
+      );
+    }
+
+    const statusEmoji = config.status === 'approved' ? '✅' : 
+                        config.status === 'rejected' ? '❌' : '⏳';
+
+    const viewMessage = `
+📱 *Your Telebirr Configuration*
+
+📞 *Number:* ${config.telebirrNumber}
+🔐 *Password:* ${'•'.repeat(config.telebirrPassword.length)}
+📊 *Status:* ${statusEmoji} ${config.status.toUpperCase()}
+${config.status === 'approved' ? '✅ Active and ready to use' : ''}
+${config.status === 'pending' ? '⏳ Waiting for verification' : ''}
+${config.status === 'rejected' ? '❌ Rejected - Please contact support' : ''}
+
+To update your configuration, use /setuptelebirr
+    `;
+
+    bot.sendMessage(chatId, viewMessage, { parse_mode: 'Markdown' });
+
+  } catch (error) {
+    console.error('Error viewing config:', error);
+    bot.sendMessage(chatId, '❌ Failed to fetch configuration.');
+  }
+});
+
+// =====================
+// CALLBACK QUERY HANDLER
+// =====================
+
 bot.on('callback_query', async (callbackQuery) => {
   const msg = callbackQuery.message;
   const chatId = msg.chat.id;
   const userId = callbackQuery.from.id.toString();
   const data = callbackQuery.data;
 
+  // Help callback
   if (data === 'help') {
     const helpMessage = `
 📚 *Help & Support*
@@ -612,6 +847,8 @@ How to use Habesha:
 
 *Admin Commands:*
 /upload - Upload new content
+/setuptelebirr - Set up Telebirr configuration
+/viewtelebirr - View your Telebirr configuration
 /cancel - Cancel current upload
 
 For support: @habesha_support
@@ -620,13 +857,61 @@ For support: @habesha_support
     return bot.answerCallbackQuery(callbackQuery.id);
   }
 
+  // Upload callback
   if (data === 'upload') {
-    // Trigger upload command
     bot.emit('text', { chat: { id: chatId }, from: { id: userId }, text: '/upload' });
     return bot.answerCallbackQuery(callbackQuery.id);
   }
 
-  // Handle upload confirmation
+  // Telebirr setup callback
+  if (data === 'setuptelebirr') {
+    bot.emit('text', { chat: { id: chatId }, from: { id: userId }, text: '/setuptelebirr' });
+    return bot.answerCallbackQuery(callbackQuery.id);
+  }
+
+  // Telebirr update
+  if (data === 'update_telebirr') {
+    tempTelebirrConfig[userId] = {
+      step: 'number',
+      data: {}
+    };
+
+    const updateMessage = `
+📱 *Update Telebirr Configuration*
+
+*Step 1 of 2: Enter New Telebirr Number*
+
+Please enter your new Telebirr phone number.
+
+Format: 09XXXXXXXX
+
+Type /cancel to cancel the update.
+    `;
+
+    bot.sendMessage(chatId, updateMessage, { parse_mode: 'Markdown' });
+    return bot.answerCallbackQuery(callbackQuery.id);
+  }
+
+  if (data === 'keep_telebirr') {
+    bot.sendMessage(chatId, '✅ Keeping current configuration.');
+    return bot.answerCallbackQuery(callbackQuery.id);
+  }
+
+  // Telebirr Approval
+  if (data.startsWith('approve_telebirr_')) {
+    const configId = data.replace('approve_telebirr_', '');
+    await approveTelebirrConfig(configId, userId, chatId);
+    return bot.answerCallbackQuery(callbackQuery.id);
+  }
+
+  // Telebirr Rejection
+  if (data.startsWith('reject_telebirr_')) {
+    const configId = data.replace('reject_telebirr_', '');
+    await rejectTelebirrConfig(configId, userId, chatId);
+    return bot.answerCallbackQuery(callbackQuery.id);
+  }
+
+  // Upload confirmation
   if (data === 'confirm_upload') {
     await confirmUpload(userId, chatId);
     return bot.answerCallbackQuery(callbackQuery.id);
@@ -640,10 +925,165 @@ For support: @habesha_support
     return bot.answerCallbackQuery(callbackQuery.id);
   }
 
+  // Payment approval (existing)
+  if (data.startsWith('approve_payment_')) {
+    const purchaseId = data.replace('approve_payment_', '');
+    await approvePayment(purchaseId, userId, chatId);
+    return bot.answerCallbackQuery(callbackQuery.id);
+  }
+
+  if (data.startsWith('reject_payment_')) {
+    const purchaseId = data.replace('reject_payment_', '');
+    await rejectPayment(purchaseId, userId, chatId);
+    return bot.answerCallbackQuery(callbackQuery.id);
+  }
+
   bot.answerCallbackQuery(callbackQuery.id);
 });
 
-// Confirm and save upload
+// =====================
+// APPROVAL FUNCTIONS
+// =====================
+
+async function approveTelebirrConfig(configId, adminTelegramId, chatId) {
+  try {
+    const admin = await User.findOne({ telegramId: adminTelegramId });
+    if (!admin || admin.adminRole !== 'super_admin') {
+      return bot.sendMessage(chatId, '❌ Only super admins can approve Telebirr configurations.');
+    }
+
+    const config = await AdminConfig.findById(configId).populate('adminId');
+    if (!config) {
+      return bot.sendMessage(chatId, '❌ Configuration not found.');
+    }
+
+    if (config.status !== 'pending') {
+      return bot.sendMessage(chatId, `ℹ️ This configuration is already ${config.status}.`);
+    }
+
+    config.status = 'approved';
+    config.approvedBy = admin._id;
+    config.approvedAt = new Date();
+    await config.save();
+
+    // Notify the admin (they don't know about main admin)
+    try {
+      await bot.sendMessage(
+        config.telegramId,
+        `✅ *Telebirr Configuration Verified!*
+
+Your Telebirr configuration has been verified and approved.
+
+📱 *Number:* ${config.telebirrNumber}
+📊 *Status:* ✅ Approved
+
+You can now accept payments through Telebirr.
+
+Thank you for your patience! 🙏
+        `,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (error) {
+      console.error('Failed to notify admin:', error);
+    }
+
+    // Notify all super admins
+    const superAdmins = await User.find({ adminRole: 'super_admin' });
+    for (const superAdmin of superAdmins) {
+      try {
+        await bot.sendMessage(
+          superAdmin.telegramId,
+          `✅ *Telebirr Configuration Approved*
+
+👤 *Admin:* ${config.adminName}
+📱 *Number:* ${config.telebirrNumber}
+👤 *Approved by:* ${admin.name}
+📅 *Date:* ${new Date().toLocaleString()}
+          `,
+          { parse_mode: 'Markdown' }
+        );
+      } catch (error) {
+        console.error('Failed to notify super admin:', error);
+      }
+    }
+
+    bot.sendMessage(chatId, `✅ Telebirr configuration approved successfully!`);
+
+  } catch (error) {
+    console.error('Approval error:', error);
+    bot.sendMessage(chatId, '❌ Failed to approve configuration.');
+  }
+}
+
+async function rejectTelebirrConfig(configId, adminTelegramId, chatId) {
+  try {
+    const admin = await User.findOne({ telegramId: adminTelegramId });
+    if (!admin || admin.adminRole !== 'super_admin') {
+      return bot.sendMessage(chatId, '❌ Only super admins can reject Telebirr configurations.');
+    }
+
+    const config = await AdminConfig.findById(configId).populate('adminId');
+    if (!config) {
+      return bot.sendMessage(chatId, '❌ Configuration not found.');
+    }
+
+    if (config.status !== 'pending') {
+      return bot.sendMessage(chatId, `ℹ️ This configuration is already ${config.status}.`);
+    }
+
+    config.status = 'rejected';
+    config.approvedBy = admin._id;
+    config.approvedAt = new Date();
+    await config.save();
+
+    // Notify the admin
+    try {
+      await bot.sendMessage(
+        config.telegramId,
+        `❌ *Telebirr Configuration Rejected*
+
+Your Telebirr configuration has been rejected.
+
+📱 *Number:* ${config.telebirrNumber}
+📊 *Status:* ❌ Rejected
+
+Please contact support for more information.
+You can try again with /setuptelebirr
+        `,
+        { parse_mode: 'Markdown' }
+      );
+    } catch (error) {
+      console.error('Failed to notify admin:', error);
+    }
+
+    // Notify all super admins
+    const superAdmins = await User.find({ adminRole: 'super_admin' });
+    for (const superAdmin of superAdmins) {
+      try {
+        await bot.sendMessage(
+          superAdmin.telegramId,
+          `❌ *Telebirr Configuration Rejected*
+
+👤 *Admin:* ${config.adminName}
+📱 *Number:* ${config.telebirrNumber}
+👤 *Rejected by:* ${admin.name}
+📅 *Date:* ${new Date().toLocaleString()}
+          `,
+          { parse_mode: 'Markdown' }
+        );
+      } catch (error) {
+        console.error('Failed to notify super admin:', error);
+      }
+    }
+
+    bot.sendMessage(chatId, `❌ Telebirr configuration rejected.`);
+
+  } catch (error) {
+    console.error('Rejection error:', error);
+    bot.sendMessage(chatId, '❌ Failed to reject configuration.');
+  }
+}
+
 async function confirmUpload(userId, chatId) {
   try {
     if (!tempUploads[userId]) {
@@ -657,7 +1097,6 @@ async function confirmUpload(userId, chatId) {
       return bot.sendMessage(chatId, '❌ User not found.');
     }
 
-    // Create media in database
     const media = new Media({
       title: data.title,
       description: data.description || '',
@@ -672,10 +1111,8 @@ async function confirmUpload(userId, chatId) {
 
     await media.save();
 
-    // Clear temp upload
     delete tempUploads[userId];
 
-    // Success message
     const successMessage = `
 ✅ *Upload Successful!*
 
@@ -702,7 +1139,6 @@ Click the button below to view it in the app.
 
     bot.sendMessage(chatId, successMessage, options);
 
-    // Notify all admins about new upload
     const admins = await User.find({ isAdmin: true });
     for (const admin of admins) {
       try {
@@ -729,9 +1165,151 @@ Click the button below to view it in the app.
 }
 
 // =====================
-// ROOT ROUTE
+// PAYMENT HANDLERS (Existing)
 // =====================
 
+async function approvePayment(purchaseId, adminTelegramId, chatId) {
+  try {
+    const admin = await User.findOne({ telegramId: adminTelegramId });
+    if (!admin || !admin.isAdmin) {
+      return bot.sendMessage(chatId, '❌ You do not have permission to approve payments.');
+    }
+
+    const purchase = await Purchase.findById(purchaseId).populate('mediaId').populate('userId');
+    if (!purchase) {
+      return bot.sendMessage(chatId, '❌ Purchase not found.');
+    }
+
+    if (purchase.status === 'completed') {
+      return bot.sendMessage(chatId, 'ℹ️ This payment has already been approved.');
+    }
+
+    purchase.status = 'completed';
+    purchase.adminApprovedBy = admin._id;
+    purchase.approvedAt = new Date();
+    await purchase.save();
+
+    await User.findByIdAndUpdate(purchase.userId, {
+      $addToSet: { purchases: purchase.mediaId }
+    });
+
+    try {
+      await bot.sendMessage(purchase.userId.telegramId,
+        `✅ *Payment Approved!*\n\n` +
+        `Your payment for "${purchase.mediaId.title}" has been approved.\n` +
+        `💰 Amount: $${purchase.amount}\n` +
+        `📅 Date: ${new Date().toLocaleString()}\n\n` +
+        `You can now access the content in the app! 🎉`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '📱 Open App', web_app: { url: process.env.APP_URL } }]
+            ]
+          }
+        }
+      );
+    } catch (error) {
+      console.error('Failed to notify user:', error);
+    }
+
+    const admins = await User.find({ isAdmin: true });
+    for (const adminUser of admins) {
+      try {
+        await bot.sendMessage(adminUser.telegramId,
+          `✅ *Payment Approved*\n\n` +
+          `Purchase ID: ${purchase._id}\n` +
+          `User: ${purchase.userId.name}\n` +
+          `Content: ${purchase.mediaId.title}\n` +
+          `Amount: $${purchase.amount}\n` +
+          `Approved by: ${admin.name}\n` +
+          `Date: ${new Date().toLocaleString()}`,
+          { parse_mode: 'Markdown' }
+        );
+      } catch (error) {
+        console.error('Failed to notify admin:', error);
+      }
+    }
+
+    bot.sendMessage(chatId, `✅ Payment approved successfully! User has been notified.`);
+
+  } catch (error) {
+    console.error('Approval error:', error);
+    bot.sendMessage(chatId, '❌ Failed to approve payment.');
+  }
+}
+
+async function rejectPayment(purchaseId, adminTelegramId, chatId) {
+  try {
+    const admin = await User.findOne({ telegramId: adminTelegramId });
+    if (!admin || !admin.isAdmin) {
+      return bot.sendMessage(chatId, '❌ You do not have permission to reject payments.');
+    }
+
+    const purchase = await Purchase.findById(purchaseId).populate('mediaId').populate('userId');
+    if (!purchase) {
+      return bot.sendMessage(chatId, '❌ Purchase not found.');
+    }
+
+    if (purchase.status === 'completed') {
+      return bot.sendMessage(chatId, 'ℹ️ This payment has already been approved.');
+    }
+
+    purchase.status = 'failed';
+    purchase.adminApprovedBy = admin._id;
+    await purchase.save();
+
+    try {
+      await bot.sendMessage(purchase.userId.telegramId,
+        `❌ *Payment Rejected*\n\n` +
+        `Your payment for "${purchase.mediaId.title}" has been rejected.\n` +
+        `💰 Amount: $${purchase.amount}\n` +
+        `📅 Date: ${new Date().toLocaleString()}\n\n` +
+        `Please contact support for more information.`,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '📱 Open App', web_app: { url: process.env.APP_URL } }]
+            ]
+          }
+        }
+      );
+    } catch (error) {
+      console.error('Failed to notify user:', error);
+    }
+
+    const admins = await User.find({ isAdmin: true });
+    for (const adminUser of admins) {
+      try {
+        await bot.sendMessage(adminUser.telegramId,
+          `❌ *Payment Rejected*\n\n` +
+          `Purchase ID: ${purchase._id}\n` +
+          `User: ${purchase.userId.name}\n` +
+          `Content: ${purchase.mediaId.title}\n` +
+          `Amount: $${purchase.amount}\n` +
+          `Rejected by: ${admin.name}\n` +
+          `Date: ${new Date().toLocaleString()}`,
+          { parse_mode: 'Markdown' }
+        );
+      } catch (error) {
+        console.error('Failed to notify admin:', error);
+      }
+    }
+
+    bot.sendMessage(chatId, `❌ Payment rejected. User has been notified.`);
+
+  } catch (error) {
+    console.error('Rejection error:', error);
+    bot.sendMessage(chatId, '❌ Failed to reject payment.');
+  }
+}
+
+// =====================
+// API ENDPOINTS
+// =====================
+
+// Root route
 app.get('/', (req, res) => {
   res.json({
     name: 'Habesha API',
@@ -747,15 +1325,16 @@ app.get('/', (req, res) => {
   });
 });
 
-// API Documentation Route
+// API Documentation
 app.get('/api/docs', (req, res) => {
   res.json({
     endpoints: {
       'POST /api/auth/telegram': 'Authenticate user with Telegram',
       'GET /api/media': 'Get all media content',
       'GET /api/media/:id': 'Get single media by ID',
-      'POST /api/purchase/initiate': 'Initiate purchase',
-      'POST /api/purchase/verify': 'Verify payment',
+      'POST /api/payment/initiate': 'Initiate payment',
+      'POST /api/payment/screenshot': 'Upload payment screenshot',
+      'GET /api/payment/status/:purchaseId': 'Get payment status',
       'GET /api/purchases': 'Get user purchases',
       'POST /api/admin/media': 'Upload media (Admin)',
       'PUT /api/admin/media/:id': 'Update media (Admin)',
@@ -768,20 +1347,11 @@ app.get('/api/docs', (req, res) => {
       'PUT /api/admin/admins/:adminId': 'Update admin (Admin)',
       'DELETE /api/admin/admins/:adminId': 'Remove admin (Admin)',
       'POST /api/admin/broadcast': 'Send broadcast (Admin)'
-    },
-    admin_roles: {
-      super_admin: 'Full access to everything',
-      content_manager: 'Manage content and view analytics',
-      moderator: 'Delete and edit content',
-      support: 'Manage users only'
     }
   });
 });
 
-// =====================
-// AUTH ENDPOINTS
-// =====================
-
+// Auth endpoint
 app.post('/api/auth/telegram', async (req, res) => {
   try {
     const { telegramId, username, name } = req.body;
@@ -832,10 +1402,347 @@ app.post('/api/auth/telegram', async (req, res) => {
   }
 });
 
-// =====================
-// ADMIN MANAGEMENT ENDPOINTS
-// =====================
+// Payment endpoints
+app.post('/api/payment/initiate', authenticate, async (req, res) => {
+  try {
+    const { mediaId } = req.body;
+    const userId = req.user._id;
 
+    const media = await Media.findById(mediaId);
+    if (!media) {
+      return res.status(404).json({ error: 'Media not found' });
+    }
+
+    const existingPurchase = await Purchase.findOne({
+      userId,
+      mediaId,
+      status: 'completed'
+    });
+
+    if (existingPurchase) {
+      return res.status(400).json({ error: 'Already purchased' });
+    }
+
+    const pendingPurchase = await Purchase.findOne({
+      userId,
+      mediaId,
+      status: 'awaiting_confirmation'
+    });
+
+    if (pendingPurchase) {
+      return res.json({
+        purchaseId: pendingPurchase._id,
+        amount: media.price,
+        status: 'awaiting_confirmation',
+        message: 'Payment already pending confirmation'
+      });
+    }
+
+    // Get approved admin config
+    const adminConfig = await AdminConfig.findOne({ 
+      status: 'approved',
+      isActive: true 
+    }).populate('adminId');
+
+    if (!adminConfig) {
+      return res.status(500).json({ 
+        error: 'No admin with approved Telebirr configuration found.' 
+      });
+    }
+
+    const purchase = new Purchase({
+      userId,
+      mediaId,
+      amount: media.price,
+      status: 'awaiting_confirmation',
+      paymentMethod: 'telebirr',
+      paymentId: 'telebirr_' + Date.now()
+    });
+
+    await purchase.save();
+
+    res.json({
+      purchaseId: purchase._id,
+      amount: media.price,
+      telebirrNumber: adminConfig.telebirrNumber,
+      message: 'Please send payment to Telebirr number and upload screenshot',
+      status: 'awaiting_confirmation'
+    });
+  } catch (error) {
+    console.error('Payment initiation error:', error);
+    res.status(500).json({ error: 'Failed to initiate payment' });
+  }
+});
+
+app.post('/api/payment/screenshot', authenticate, upload.single('screenshot'), async (req, res) => {
+  try {
+    const { purchaseId } = req.body;
+    const userId = req.user._id;
+
+    if (!req.file) {
+      return res.status(400).json({ error: 'Screenshot is required' });
+    }
+
+    const purchase = await Purchase.findOne({ _id: purchaseId, userId });
+    if (!purchase) {
+      return res.status(404).json({ error: 'Purchase not found' });
+    }
+
+    if (purchase.status === 'completed') {
+      return res.status(400).json({ error: 'Already completed' });
+    }
+
+    purchase.screenshot = req.file.filename;
+    purchase.status = 'awaiting_confirmation';
+    await purchase.save();
+
+    const user = await User.findById(userId);
+    const media = await Media.findById(purchase.mediaId);
+
+    const admins = await User.find({ isAdmin: true });
+    for (const admin of admins) {
+      try {
+        const screenshotUrl = `${process.env.APP_URL}/uploads/${req.file.filename}`;
+        
+        await bot.sendPhoto(admin.telegramId, screenshotUrl, {
+          caption: 
+`💳 *New Payment Confirmation*
+
+👤 *User:* ${user.name} (@${user.username || 'N/A'})
+📱 *Telegram ID:* ${user.telegramId}
+📌 *Content:* ${media.title}
+💰 *Amount:* $${purchase.amount}
+🆔 *Purchase ID:* ${purchase._id}
+📅 *Date:* ${new Date().toLocaleString()}
+
+Please verify the payment and approve using the buttons below.`,
+          parse_mode: 'Markdown',
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: '✅ Approve Payment', callback_data: `approve_payment_${purchase._id}` },
+                { text: '❌ Reject Payment', callback_data: `reject_payment_${purchase._id}` }
+              ]
+            ]
+          }
+        });
+      } catch (error) {
+        console.error('Failed to notify admin:', error);
+      }
+    }
+
+    res.json({
+      success: true,
+      message: 'Payment screenshot uploaded. Waiting for admin approval.',
+      purchaseId: purchase._id
+    });
+  } catch (error) {
+    console.error('Screenshot upload error:', error);
+    res.status(500).json({ error: 'Failed to upload screenshot' });
+  }
+});
+
+app.get('/api/payment/status/:purchaseId', authenticate, async (req, res) => {
+  try {
+    const { purchaseId } = req.params;
+    const userId = req.user._id;
+
+    const purchase = await Purchase.findOne({ _id: purchaseId, userId })
+      .populate('mediaId', 'title price')
+      .populate('adminApprovedBy', 'name username');
+
+    if (!purchase) {
+      return res.status(404).json({ error: 'Purchase not found' });
+    }
+
+    res.json({
+      status: purchase.status,
+      amount: purchase.amount,
+      media: purchase.mediaId,
+      screenshot: purchase.screenshot ? `${process.env.APP_URL}/uploads/${purchase.screenshot}` : null,
+      adminApprovedBy: purchase.adminApprovedBy,
+      approvedAt: purchase.approvedAt,
+      createdAt: purchase.createdAt
+    });
+  } catch (error) {
+    console.error('Status check error:', error);
+    res.status(500).json({ error: 'Failed to get payment status' });
+  }
+});
+
+// Media endpoints
+app.get('/api/media', async (req, res) => {
+  try {
+    const { type, category, search } = req.query;
+    const query = { isPublished: true };
+    
+    if (type) query.type = type;
+    if (category) query.category = category;
+    if (search) {
+      query.$or = [
+        { title: { $regex: search, $options: 'i' } },
+        { description: { $regex: search, $options: 'i' } }
+      ];
+    }
+
+    const media = await Media.find(query)
+      .sort({ createdAt: -1 })
+      .limit(50);
+
+    const userId = req.user?._id;
+    const mediaWithStatus = await Promise.all(media.map(async (item) => {
+      const isPurchased = userId ? await Purchase.findOne({ 
+        userId, 
+        mediaId: item._id,
+        status: 'completed'
+      }) : false;
+
+      return {
+        ...item.toObject(),
+        isPurchased: !!isPurchased,
+        isFree: item.price === 0
+      };
+    }));
+
+    res.json(mediaWithStatus);
+  } catch (error) {
+    console.error('Error fetching media:', error);
+    res.status(500).json({ error: 'Failed to fetch media' });
+  }
+});
+
+app.get('/api/media/:id', async (req, res) => {
+  try {
+    const media = await Media.findById(req.params.id);
+    if (!media) {
+      return res.status(404).json({ error: 'Media not found' });
+    }
+
+    media.views += 1;
+    await media.save();
+
+    const userId = req.user?._id;
+    let isPurchased = false;
+    
+    if (userId) {
+      const purchase = await Purchase.findOne({
+        userId,
+        mediaId: media._id,
+        status: 'completed'
+      });
+      isPurchased = !!purchase;
+    }
+
+    res.json({
+      ...media.toObject(),
+      isPurchased,
+      isFree: media.price === 0
+    });
+  } catch (error) {
+    console.error('Error fetching media:', error);
+    res.status(500).json({ error: 'Failed to fetch media' });
+  }
+});
+
+// Admin Media endpoints
+app.post('/api/admin/media', authenticate, checkAdminPermission('uploadContent'), upload.single('file'), async (req, res) => {
+  try {
+    const { title, description, type, category, price } = req.body;
+    
+    if (!req.file) {
+      return res.status(400).json({ error: 'File is required' });
+    }
+
+    const media = new Media({
+      title,
+      description,
+      type,
+      category,
+      price: parseFloat(price) || 0,
+      file: req.file.filename,
+      thumbnail: req.file.filename,
+      uploadedBy: req.user._id
+    });
+
+    await media.save();
+
+    const admins = await User.find({ isAdmin: true });
+    for (const admin of admins) {
+      try {
+        await bot.sendMessage(admin.telegramId, 
+          `📹 New content uploaded\n` +
+          `Title: ${title}\n` +
+          `Type: ${type}\n` +
+          `Category: ${category}\n` +
+          `Price: $${price || 0}\n` +
+          `Uploaded by: ${req.user.name}`
+        );
+      } catch (error) {
+        console.error('Failed to notify admin:', error);
+      }
+    }
+
+    res.status(201).json({
+      success: true,
+      message: 'Content uploaded successfully',
+      media
+    });
+  } catch (error) {
+    console.error('Upload error:', error);
+    res.status(500).json({ error: 'Upload failed' });
+  }
+});
+
+app.put('/api/admin/media/:id', authenticate, checkAdminPermission('editContent'), async (req, res) => {
+  try {
+    const { title, description, price, isPublished } = req.body;
+    const media = await Media.findByIdAndUpdate(
+      req.params.id,
+      { title, description, price, isPublished },
+      { new: true }
+    );
+
+    if (!media) {
+      return res.status(404).json({ error: 'Media not found' });
+    }
+
+    res.json({
+      success: true,
+      message: 'Content updated successfully',
+      media
+    });
+  } catch (error) {
+    console.error('Update error:', error);
+    res.status(500).json({ error: 'Update failed' });
+  }
+});
+
+app.delete('/api/admin/media/:id', authenticate, checkAdminPermission('deleteContent'), async (req, res) => {
+  try {
+    const media = await Media.findById(req.params.id);
+    if (!media) {
+      return res.status(404).json({ error: 'Media not found' });
+    }
+
+    if (media.file) {
+      const filePath = path.join(__dirname, 'uploads', media.file);
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+      }
+    }
+
+    await media.remove();
+    res.json({
+      success: true,
+      message: 'Content deleted successfully'
+    });
+  } catch (error) {
+    console.error('Delete error:', error);
+    res.status(500).json({ error: 'Delete failed' });
+  }
+});
+
+// Admin Management endpoints
 app.get('/api/admin/admins', authenticate, checkAdminPermission('manageAdmins'), async (req, res) => {
   try {
     const admins = await User.find({ isAdmin: true })
@@ -886,20 +1793,6 @@ app.post('/api/admin/admins', authenticate, checkAdminPermission('manageAdmins')
       );
     } catch (error) {
       console.error('Failed to notify new admin:', error);
-    }
-    
-    const superAdmins = await User.find({ adminRole: 'super_admin' });
-    for (const admin of superAdmins) {
-      try {
-        await bot.sendMessage(admin.telegramId,
-          `👤 New admin added\n` +
-          `User: ${user.name} (@${user.username})\n` +
-          `Role: ${user.adminRole}\n` +
-          `Added by: ${req.user.name}`
-        );
-      } catch (error) {
-        console.error('Failed to notify super admin:', error);
-      }
     }
     
     res.status(201).json({
@@ -1003,10 +1896,7 @@ app.delete('/api/admin/admins/:adminId', authenticate, checkAdminPermission('man
   }
 });
 
-// =====================
-// USER MANAGEMENT ENDPOINTS
-// =====================
-
+// User Management endpoints
 app.get('/api/admin/users', authenticate, checkAdminPermission('manageUsers'), async (req, res) => {
   try {
     const { search, isAdmin, banned, limit = 50, skip = 0 } = req.query;
@@ -1096,314 +1986,7 @@ app.put('/api/admin/users/:userId/ban', authenticate, checkAdminPermission('mana
   }
 });
 
-// =====================
-// MEDIA ENDPOINTS
-// =====================
-
-app.get('/api/media', async (req, res) => {
-  try {
-    const { type, category, search } = req.query;
-    const query = { isPublished: true };
-    
-    if (type) query.type = type;
-    if (category) query.category = category;
-    if (search) {
-      query.$or = [
-        { title: { $regex: search, $options: 'i' } },
-        { description: { $regex: search, $options: 'i' } }
-      ];
-    }
-
-    const media = await Media.find(query)
-      .sort({ createdAt: -1 })
-      .limit(50);
-
-    const userId = req.user?._id;
-    const mediaWithStatus = await Promise.all(media.map(async (item) => {
-      const isPurchased = userId ? await Purchase.findOne({ 
-        userId, 
-        mediaId: item._id,
-        status: 'completed'
-      }) : false;
-
-      return {
-        ...item.toObject(),
-        isPurchased: !!isPurchased,
-        isFree: item.price === 0
-      };
-    }));
-
-    res.json(mediaWithStatus);
-  } catch (error) {
-    console.error('Error fetching media:', error);
-    res.status(500).json({ error: 'Failed to fetch media' });
-  }
-});
-
-app.get('/api/media/:id', async (req, res) => {
-  try {
-    const media = await Media.findById(req.params.id);
-    if (!media) {
-      return res.status(404).json({ error: 'Media not found' });
-    }
-
-    media.views += 1;
-    await media.save();
-
-    const userId = req.user?._id;
-    let isPurchased = false;
-    
-    if (userId) {
-      const purchase = await Purchase.findOne({
-        userId,
-        mediaId: media._id,
-        status: 'completed'
-      });
-      isPurchased = !!purchase;
-    }
-
-    res.json({
-      ...media.toObject(),
-      isPurchased,
-      isFree: media.price === 0
-    });
-  } catch (error) {
-    console.error('Error fetching media:', error);
-    res.status(500).json({ error: 'Failed to fetch media' });
-  }
-});
-
-// =====================
-// CONTENT MANAGEMENT ENDPOINTS (Admin)
-// =====================
-
-app.post('/api/admin/media', authenticate, checkAdminPermission('uploadContent'), upload.single('file'), async (req, res) => {
-  try {
-    const { title, description, type, category, price } = req.body;
-    
-    if (!req.file) {
-      return res.status(400).json({ error: 'File is required' });
-    }
-
-    const media = new Media({
-      title,
-      description,
-      type,
-      category,
-      price: parseFloat(price) || 0,
-      file: req.file.filename,
-      thumbnail: req.file.filename,
-      uploadedBy: req.user._id
-    });
-
-    await media.save();
-
-    // Notify all admins
-    const admins = await User.find({ isAdmin: true });
-    for (const admin of admins) {
-      try {
-        await bot.sendMessage(admin.telegramId, 
-          `📹 New content uploaded\n` +
-          `Title: ${title}\n` +
-          `Type: ${type}\n` +
-          `Category: ${category}\n` +
-          `Price: $${price || 0}\n` +
-          `Uploaded by: ${req.user.name}`
-        );
-      } catch (error) {
-        console.error('Failed to notify admin:', error);
-      }
-    }
-
-    res.status(201).json({
-      success: true,
-      message: 'Content uploaded successfully',
-      media
-    });
-  } catch (error) {
-    console.error('Upload error:', error);
-    res.status(500).json({ error: 'Upload failed' });
-  }
-});
-
-app.put('/api/admin/media/:id', authenticate, checkAdminPermission('editContent'), async (req, res) => {
-  try {
-    const { title, description, price, isPublished } = req.body;
-    const media = await Media.findByIdAndUpdate(
-      req.params.id,
-      { title, description, price, isPublished },
-      { new: true }
-    );
-
-    if (!media) {
-      return res.status(404).json({ error: 'Media not found' });
-    }
-
-    res.json({
-      success: true,
-      message: 'Content updated successfully',
-      media
-    });
-  } catch (error) {
-    console.error('Update error:', error);
-    res.status(500).json({ error: 'Update failed' });
-  }
-});
-
-app.delete('/api/admin/media/:id', authenticate, checkAdminPermission('deleteContent'), async (req, res) => {
-  try {
-    const media = await Media.findById(req.params.id);
-    if (!media) {
-      return res.status(404).json({ error: 'Media not found' });
-    }
-
-    if (media.file) {
-      const filePath = path.join(__dirname, 'uploads', media.file);
-      if (fs.existsSync(filePath)) {
-        fs.unlinkSync(filePath);
-      }
-    }
-
-    await media.remove();
-    res.json({
-      success: true,
-      message: 'Content deleted successfully'
-    });
-  } catch (error) {
-    console.error('Delete error:', error);
-    res.status(500).json({ error: 'Delete failed' });
-  }
-});
-
-// =====================
-// PURCHASE ENDPOINTS
-// =====================
-
-app.post('/api/purchase/initiate', authenticate, async (req, res) => {
-  try {
-    const { mediaId } = req.body;
-    const userId = req.user._id;
-
-    const media = await Media.findById(mediaId);
-    if (!media) {
-      return res.status(404).json({ error: 'Media not found' });
-    }
-
-    const existingPurchase = await Purchase.findOne({
-      userId,
-      mediaId,
-      status: 'completed'
-    });
-
-    if (existingPurchase) {
-      return res.status(400).json({ error: 'Already purchased' });
-    }
-
-    if (media.price === 0) {
-      const purchase = new Purchase({
-        userId,
-        mediaId,
-        amount: 0,
-        status: 'completed',
-        paymentId: 'free_' + Date.now()
-      });
-      await purchase.save();
-
-      await User.findByIdAndUpdate(userId, {
-        $addToSet: { purchases: mediaId }
-      });
-
-      const admins = await User.find({ isAdmin: true });
-      for (const admin of admins) {
-        try {
-          await bot.sendMessage(admin.telegramId, 
-            `📥 Free content accessed\n` +
-            `User: ${req.user.name}\n` +
-            `Content: ${media.title}`
-          );
-        } catch (error) {
-          console.error('Failed to notify admin:', error);
-        }
-      }
-
-      return res.json({ success: true, free: true });
-    }
-
-    const purchase = new Purchase({
-      userId,
-      mediaId,
-      amount: media.price,
-      status: 'pending',
-      paymentId: 'pending_' + Date.now()
-    });
-    await purchase.save();
-
-    const paymentUrl = `${process.env.APP_URL}/payment/${purchase._id}`;
-
-    res.json({
-      purchaseId: purchase._id,
-      amount: media.price,
-      paymentUrl
-    });
-  } catch (error) {
-    console.error('Purchase error:', error);
-    res.status(500).json({ error: 'Purchase failed' });
-  }
-});
-
-app.post('/api/purchase/verify', authenticate, async (req, res) => {
-  try {
-    const { purchaseId, paymentId } = req.body;
-    const userId = req.user._id;
-
-    const purchase = await Purchase.findOne({ _id: purchaseId, userId });
-    if (!purchase) {
-      return res.status(404).json({ error: 'Purchase not found' });
-    }
-
-    if (purchase.status === 'completed') {
-      return res.json({ success: true });
-    }
-
-    // Simulate payment verification
-    const isVerified = true;
-
-    if (isVerified) {
-      purchase.status = 'completed';
-      purchase.paymentId = paymentId || 'verified_' + Date.now();
-      await purchase.save();
-
-      await User.findByIdAndUpdate(userId, {
-        $addToSet: { purchases: purchase.mediaId }
-      });
-
-      const admins = await User.find({ isAdmin: true });
-      for (const admin of admins) {
-        try {
-          const media = await Media.findById(purchase.mediaId);
-          await bot.sendMessage(admin.telegramId, 
-            `💰 New purchase\n` +
-            `User: ${req.user.name}\n` +
-            `Content: ${media.title}\n` +
-            `Amount: $${purchase.amount}`
-          );
-        } catch (error) {
-          console.error('Failed to notify admin:', error);
-        }
-      }
-
-      res.json({ success: true });
-    } else {
-      purchase.status = 'failed';
-      await purchase.save();
-      res.status(400).json({ error: 'Payment verification failed' });
-    }
-  } catch (error) {
-    console.error('Verification error:', error);
-    res.status(500).json({ error: 'Verification failed' });
-  }
-});
-
+// Purchases endpoint
 app.get('/api/purchases', authenticate, async (req, res) => {
   try {
     const purchases = await Purchase.find({
@@ -1418,10 +2001,7 @@ app.get('/api/purchases', authenticate, async (req, res) => {
   }
 });
 
-// =====================
-// STATS ENDPOINTS
-// =====================
-
+// Admin Stats
 app.get('/api/admin/stats', authenticate, checkAdminPermission('viewAnalytics'), async (req, res) => {
   try {
     const totalUsers = await User.countDocuments();
@@ -1459,10 +2039,7 @@ app.get('/api/admin/stats', authenticate, checkAdminPermission('viewAnalytics'),
   }
 });
 
-// =====================
-// BROADCAST ENDPOINTS
-// =====================
-
+// Broadcast endpoint
 app.post('/api/admin/broadcast', authenticate, checkAdminPermission('broadcastMessages'), async (req, res) => {
   try {
     const { message, targetUsers = 'all', targetAdmins = false } = req.body;
@@ -1502,10 +2079,7 @@ app.post('/api/admin/broadcast', authenticate, checkAdminPermission('broadcastMe
   }
 });
 
-// =====================
-// 404 HANDLER
-// =====================
-
+// 404 handler
 app.use((req, res) => {
   res.status(404).json({ 
     error: 'Endpoint not found',
@@ -1513,10 +2087,7 @@ app.use((req, res) => {
   });
 });
 
-// =====================
-// ERROR HANDLING
-// =====================
-
+// Error handler
 app.use((err, req, res, next) => {
   console.error('Error:', err);
   res.status(500).json({ 
